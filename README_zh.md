@@ -66,6 +66,11 @@ import cmpext3
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"Extension loaded: {cmpext3.__file__}")
 ```
+或者运行测试工具
+```
+python tools/bench.py
+```
+
 ## 实现目的
 
 **主要目的**：本扩展是论文《XXXX》（请替换为实际论文名称）中计算原理的验证实现。重点在于验证CMP 170HX上的限制规避策略。
