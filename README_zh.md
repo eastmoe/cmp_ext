@@ -86,3 +86,6 @@ print(f"Extension loaded: {cmpext3.__file__}")
 ## 许可证
 MIT
 
+## ComfyUI 扩展
+参照[ComfyUI-CMP-Extention](https://github.com/eastmoe/ComfyUI-CMP-Extention)以在ComfyUI中获得加速
+
