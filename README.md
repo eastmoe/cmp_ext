@@ -1,7 +1,7 @@
 
 # cmpext3 - PyTorch CUDA Extension
 
-[中文版 README](README_zh.MD)
+[中文版](README_zh.md)
 
 This is a CUDA extension based on PyTorch, primarily used to verify the computational principles proposed in the paper **"XXXX"**. The engineering value of this extension is limited; it is mainly intended for principle verification and experimental use.
 
