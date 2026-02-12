@@ -3,7 +3,7 @@
 
 [中文版](README_zh.md)
 
-This is a CUDA extension based on PyTorch, primarily used to verify the computational principles proposed in the paper **"XXXX"**. The engineering value of this extension is limited; it is mainly intended for principle verification and experimental use.
+This is a CUDA extension based on PyTorch, primarily used to verify the computational principles proposed in the paper ["Instruction-Level Performance Analysis and Optimization Strategies for Constrained AI Accelerators A Case Study of CMP 170HX"](./paper/paper_20260208.pdf). The engineering value of this extension is limited; it is mainly intended for principle verification and experimental use.
 
 ## Included Operators
 
