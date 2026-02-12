@@ -55,8 +55,11 @@ Ensure you have the correct versions of PyTorch and CUDA Toolkit installed:
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### 2. Install Extension
+### 2. Download and Install Extension
 ```bash
+# From GitHUB download the source.
+git clone https://github.com/eastmoe/cmp_ext
+cd cmp_ext
 # Install from source
 pip install -e . --no-build-isolation
 ```
