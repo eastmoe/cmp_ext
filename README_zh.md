@@ -52,9 +52,12 @@
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### 2.安装扩展
+### 2.下载并安装扩展
 ```
+# 从GitHub下载源码
+git clone https://github.com/eastmoe/cmp_ext
 # 从源码安装
+cd cmp_ext
 pip install -e . --no-build-isolation
 ```
 ### 3.验证安装
