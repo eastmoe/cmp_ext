@@ -2,6 +2,10 @@
 
 这是一个基于PyTorch的CUDA扩展，主要用于验证论文 **[《Instruction-Level Performance Analysis and Optimization Strategies for Constrained AI Accelerators A Case Study of CMP 170HX》](https://doi.org/10.5281/zenodo.18994970).** 中提出的计算原理。本扩展工程价值有限，主要作为原理性验证和实验使用。
 
+## llama.cpp
+
+[点击这里](https://github.com/eastmoe/CMPGPU-patch-script) 可以找到一个为 [llama.cpp](https://github.com/ggml-org/llama.cpp) 制作的Patch脚本。
+
 ## 包含的算子
 
 扩展实现了以下算子在三种精度（FP16、FP32、BF16）下的CUDA实现：
