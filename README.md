@@ -5,6 +5,10 @@
 
 This is a CUDA extension based on PyTorch, primarily used to verify the computational principles proposed in the paper **["Instruction-Level Performance Analysis and Optimization Strategies for Constrained AI Accelerators A Case Study of CMP 170HX"](https://doi.org/10.5281/zenodo.18994970).** The engineering value of this extension is limited; it is mainly intended for principle verification and experimental use.
 
+## llama.cpp
+
+[Here](https://github.com/eastmoe/CMPGPU-patch-script) is a patch script for [llama.cpp](https://github.com/ggml-org/llama.cpp)
+
 ## Included Operators
 
 The extension implements CUDA versions of the following operators in three precisions (FP16, FP32, BF16):
