@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 // =========================================================================
 // A100 CUDA CORE 极限优化配置 (Native BF16 SIMT)
@@ -25,23 +26,37 @@
 // =========================================================================
 // 辅助函数：安全的向量化加载
 // =========================================================================
-__device__ __forceinline__ void load_gmem_vectorized(const __nv_bfloat16* ptr, int4& dest, bool pred) {
-    if (pred) {
+__device__ __forceinline__ void load_gmem_vectorized(const __nv_bfloat16* ptr, int4& dest, bool row_valid, int valid_count) {
+    __nv_bfloat16* dst_ptr = reinterpret_cast<__nv_bfloat16*>(&dest);
+
+    if (row_valid && valid_count >= 8) {
         // 检查地址是否 16 字节对齐
         if ((reinterpret_cast<uintptr_t>(ptr) % 16) == 0) {
             dest = *reinterpret_cast<const int4*>(ptr);
         } else {
             // 不对齐时的回退路径：逐元素加载
-            __nv_bfloat16* dst_ptr = reinterpret_cast<__nv_bfloat16*>(&dest);
             #pragma unroll
             for(int i=0; i<8; ++i) dst_ptr[i] = ptr[i];
         }
     } else {
-        // 越界填充 0
-        __nv_bfloat16* dst_ptr = reinterpret_cast<__nv_bfloat16*>(&dest);
+        // 越界或尾块填充 0，避免 128-bit 读取跨过有效行尾。
         #pragma unroll
-        for(int i=0; i<8; ++i) dst_ptr[i] = __float2bfloat16(0.0f);
+        for(int i=0; i<8; ++i) {
+            dst_ptr[i] = (row_valid && i < valid_count) ? ptr[i] : __float2bfloat16(0.0f);
+        }
     }
+}
+
+__device__ __forceinline__ half2 bf16x2_to_half2(__nv_bfloat162 value) {
+    return __float22half2_rn(__bfloat1622float2(value));
+}
+
+__device__ __forceinline__ half2 bf16_to_half2(__nv_bfloat16 value) {
+    return __float2half2_rn(__bfloat162float(value));
+}
+
+__device__ __forceinline__ __nv_bfloat162 half2_to_bf16x2(half2 value) {
+    return __float22bfloat162_rn(__half22float2(value));
 }
 
 // =========================================================================
@@ -62,9 +77,9 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
     __shared__ alignas(16) __nv_bfloat16 smem_b[2][BK][BN + PAD];
 
     // 寄存器分配
-    __nv_bfloat162 c_reg[TM][TN / 2];
-    __nv_bfloat16  a_frag[TM];      
-    __nv_bfloat162 b_frag[TN / 2];  
+    half2 c_reg[TM][TN / 2];
+    __nv_bfloat16 a_frag[TM];
+    half2 b_frag[TN / 2];
 
     int4 ldg_a_reg[2]; 
     int4 ldg_b_reg[2];
@@ -74,7 +89,7 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
     for (int i = 0; i < TM; ++i) {
         #pragma unroll
         for (int j = 0; j < TN / 2; ++j) {
-            c_reg[i][j] = __float2bfloat162_rn(0.0f);
+            c_reg[i][j] = __float2half2_rn(0.0f);
         }
     }
 
@@ -103,9 +118,11 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
             int g_r = by * BM + r;
             int g_c = c; // k=0
             
-            bool pred = (r < 128 && c < 32 && g_r < M && g_c < K);
+            bool row_valid = (r < 128 && c < 32 && g_r < M);
+            int remain = K - g_c;
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
             // 使用安全加载函数
-            load_gmem_vectorized(A_ptr + g_r * lda + g_c, ldg_a_reg[i], pred);
+            load_gmem_vectorized(A_ptr + g_r * lda + g_c, ldg_a_reg[i], row_valid, valid_count);
         }
 
         // Load B
@@ -116,8 +133,10 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
             int g_r = r; // k=0
             int g_c = bx * BN + c;
             
-            bool pred = (r < 32 && c < 128 && g_r < K && g_c < N);
-            load_gmem_vectorized(B_ptr + g_r * ldb + g_c, ldg_b_reg[i], pred);
+            bool row_valid = (r < 32 && c < 128 && g_r < K);
+            int remain = N - g_c;
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+            load_gmem_vectorized(B_ptr + g_r * ldb + g_c, ldg_b_reg[i], row_valid, valid_count);
         }
     }
 
@@ -151,8 +170,10 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
                 int g_r = by * BM + r;
                 int g_c = next_k + c;
                 
-                bool pred = (r < 128 && c < 32 && g_r < M && g_c < K);
-                load_gmem_vectorized(A_ptr + g_r * lda + g_c, ldg_a_reg[i], pred);
+                bool row_valid = (r < 128 && c < 32 && g_r < M);
+                int remain = K - g_c;
+                int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+                load_gmem_vectorized(A_ptr + g_r * lda + g_c, ldg_a_reg[i], row_valid, valid_count);
             }
             // Load B
             #pragma unroll
@@ -162,8 +183,10 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
                 int g_r = next_k + r;
                 int g_c = bx * BN + c;
                 
-                bool pred = (r < 32 && c < 128 && g_r < K && g_c < N);
-                load_gmem_vectorized(B_ptr + g_r * ldb + g_c, ldg_b_reg[i], pred);
+                bool row_valid = (r < 32 && c < 128 && g_r < K);
+                int remain = N - g_c;
+                int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+                load_gmem_vectorized(B_ptr + g_r * ldb + g_c, ldg_b_reg[i], row_valid, valid_count);
             }
         }
 
@@ -181,16 +204,16 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
             __nv_bfloat16* b_ptr = reinterpret_cast<__nv_bfloat16*>(&b_vec);
 
             #pragma unroll
-            for(int j=0; j < TN/2; ++j) {
+            for(int j=0; j < TN / 2; ++j) {
                 __nv_bfloat162 b_packed;
-                b_packed.x = b_ptr[j*2];
-                b_packed.y = b_ptr[j*2+1];
-                b_frag[j] = b_packed;
+                b_packed.x = b_ptr[j * 2];
+                b_packed.y = b_ptr[j * 2 + 1];
+                b_frag[j] = bf16x2_to_half2(b_packed);
             }
 
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
-                __nv_bfloat162 a_val = __bfloat162bfloat162(a_frag[i]);
+                half2 a_val = bf16_to_half2(a_frag[i]);
                 #pragma unroll
                 for (int j = 0; j < TN / 2; ++j) {
                     c_reg[i][j] = __hfma2(a_val, b_frag[j], c_reg[i][j]);
@@ -215,9 +238,10 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
             for (int j = 0; j < TN / 2; ++j) {
                 int g_c = global_col_start + j * 2;
                 if (g_c < N) {
-                    C[g_r * ldc + g_c] = c_reg[i][j].x;
+                    __nv_bfloat162 out = half2_to_bf16x2(c_reg[i][j]);
+                    C[g_r * ldc + g_c] = out.x;
                     if (g_c + 1 < N) {
-                        C[g_r * ldc + g_c + 1] = c_reg[i][j].y;
+                        C[g_r * ldc + g_c + 1] = out.y;
                     }
                 }
             }

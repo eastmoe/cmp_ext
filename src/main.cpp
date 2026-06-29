@@ -188,17 +188,6 @@ torch::Tensor custom_linear_forward(
     // 这里的 Output 形状是 [M, N]
     torch::Tensor output = torch::empty({M, N}, options);
 
-    // -------------------------------------------------------------------------
-    // 关键修正 2: 鲁棒性检查
-    // 如果 N 是奇数，目前的 Kernel 会崩溃或出错。
-    // 这里做一个回退（Fallback）或者报错。为了简单，我们先报错。
-    // -------------------------------------------------------------------------
-    if (N % 2 != 0 && input.dtype() == torch::kFloat16) {
-        // 如果你需要支持奇数 N，需要修改 CUDA Kernel 不使用 half2，或者在这里回退到 PyTorch 原生实现
-        // 这里暂时抛出异常提示
-         TORCH_CHECK(false, "Custom FP16 Kernel requires even Output Channels (N)");
-    }
-
     // 3. 执行矩阵乘法
     if (input.dtype() == torch::kFloat16) {
         launch_matmul_fp16(
@@ -296,17 +285,12 @@ torch::Tensor custom_bmm_forward(torch::Tensor input, torch::Tensor mat2) {
     auto options = torch::TensorOptions().dtype(input.dtype()).device(input.device());
     torch::Tensor output = torch::empty({B, M, N}, options);
 
-    // 3. 维度限制检查 (沿用 Linear 的逻辑)
-    if (N % 2 != 0 && input.dtype() == torch::kFloat16) {
-         TORCH_CHECK(false, "Custom FP16 Kernel requires even Output dim (N)");
-    }
-
-    // 4. 计算每个 Batch 的元素偏移量 (Stride)
+    // 3. 计算每个 Batch 的元素偏移量 (Stride)
     long long input_step = M * K;
     long long mat2_step = K * N;
     long long output_step = M * N;
 
-    // 5. 循环执行 Matmul
+    // 4. 循环执行 Matmul
     // 注意：Linear 中对 weight 做了转置，是因为 Linear 权重通常是 (N, K)。
     // 但 BMM 中 mat2 输入通常就是 (B, K, N)，符合 (M,K)x(K,N) 的顺序，因此不需要转置。
     

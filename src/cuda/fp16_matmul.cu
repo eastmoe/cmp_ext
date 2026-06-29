@@ -44,6 +44,20 @@ __device__ __forceinline__ void cp_async_pred_zfill(void* smem_ptr, const void* 
     }
 }
 
+__device__ __forceinline__ void load_half8_zfill(void* smem_ptr, const half* glob_ptr, bool row_valid, int valid_count) {
+    bool full_aligned = row_valid && valid_count >= 8 && ((reinterpret_cast<uintptr_t>(glob_ptr) & 0xF) == 0);
+    if (full_aligned) {
+        cp_async_pred_zfill(smem_ptr, glob_ptr, true);
+        return;
+    }
+
+    half* dst = reinterpret_cast<half*>(smem_ptr);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        dst[i] = (row_valid && i < valid_count) ? glob_ptr[i] : __float2half(0.0f);
+    }
+}
+
 __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -128,17 +142,21 @@ __global__ void __launch_bounds__(BLOCK_SIZE) gemm_fp16_ampere_optimized_v3(
     if (max_k_tiles > 0) {
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int r = load_a_row + i * 32; 
+            int r = load_a_row + i * 32;
             int c = load_a_col;
-            bool valid = (block_row_start + r < m) && (c < k);
-            cp_async_pred_zfill(&As[0][r][c], a + (block_row_start + r) * lda + c, valid);
+            bool row_valid = (block_row_start + r < m);
+            int remain = k - c;
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+            load_half8_zfill(&As[0][r][c], a + (block_row_start + r) * lda + c, row_valid, valid_count);
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int r = load_b_row + i * 16; 
+            int r = load_b_row + i * 16;
             int c = load_b_col;
-            bool valid = (r < k) && (block_col_start + c < n);
-            cp_async_pred_zfill(&Bs[0][r][c], b + r * ldb + (block_col_start + c), valid);
+            bool row_valid = (r < k);
+            int remain = n - (block_col_start + c);
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+            load_half8_zfill(&Bs[0][r][c], b + r * ldb + (block_col_start + c), row_valid, valid_count);
         }
         cp_async_commit();
     }
@@ -148,17 +166,21 @@ __global__ void __launch_bounds__(BLOCK_SIZE) gemm_fp16_ampere_optimized_v3(
         int k_offset = BK;
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int r = load_a_row + i * 32; 
+            int r = load_a_row + i * 32;
             int c = load_a_col;
-            bool valid = (block_row_start + r < m) && (k_offset + c < k);
-            cp_async_pred_zfill(&As[1][r][c], a + (block_row_start + r) * lda + (k_offset + c), valid);
+            bool row_valid = (block_row_start + r < m);
+            int remain = k - (k_offset + c);
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+            load_half8_zfill(&As[1][r][c], a + (block_row_start + r) * lda + (k_offset + c), row_valid, valid_count);
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int r = load_b_row + i * 16; 
+            int r = load_b_row + i * 16;
             int c = load_b_col;
-            bool valid = (k_offset + r < k) && (block_col_start + c < n);
-            cp_async_pred_zfill(&Bs[1][r][c], b + (k_offset + r) * ldb + (block_col_start + c), valid);
+            bool row_valid = (k_offset + r < k);
+            int remain = n - (block_col_start + c);
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+            load_half8_zfill(&Bs[1][r][c], b + (k_offset + r) * ldb + (block_col_start + c), row_valid, valid_count);
         }
         cp_async_commit();
     }
@@ -238,16 +260,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE) gemm_fp16_ampere_optimized_v3(
             for (int i = 0; i < 4; i++) {
                 int r = load_a_row + i * 32;
                 int c = load_a_col;
-                bool valid = (block_row_start + r < m) && (k_offset + c < k);
-                cp_async_pred_zfill(&As[load_stage][r][c], a + (block_row_start + r) * lda + (k_offset + c), valid);
+                bool row_valid = (block_row_start + r < m);
+                int remain = k - (k_offset + c);
+                int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+                load_half8_zfill(&As[load_stage][r][c], a + (block_row_start + r) * lda + (k_offset + c), row_valid, valid_count);
             }
             // Load B
             #pragma unroll
             for (int i = 0; i < 4; i++) {
                 int r = load_b_row + i * 16;
                 int c = load_b_col;
-                bool valid = (k_offset + r < k) && (block_col_start + c < n);
-                cp_async_pred_zfill(&Bs[load_stage][r][c], b + (k_offset + r) * ldb + (block_col_start + c), valid);
+                bool row_valid = (k_offset + r < k);
+                int remain = n - (block_col_start + c);
+                int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+                load_half8_zfill(&Bs[load_stage][r][c], b + (k_offset + r) * ldb + (block_col_start + c), row_valid, valid_count);
             }
             // Commit group
             cp_async_commit();
@@ -341,10 +367,10 @@ void launch_matmul_fp16(
 
 // Bias Helper (符合 Constraint 1, 3-7: 只使用 __hadd2)
 __global__ void add_bias_fp16_vectorized(
-    half2* __restrict__ output, 
+    half2* __restrict__ output,
     const half2* __restrict__ bias,
-    int total_vec_elements, 
-    int width_h2 
+    int total_vec_elements,
+    int width_h2
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total_vec_elements) {
@@ -354,13 +380,34 @@ __global__ void add_bias_fp16_vectorized(
     }
 }
 
+__global__ void add_bias_fp16_scalar(
+    half* __restrict__ output,
+    const half* __restrict__ bias,
+    int total_elements,
+    int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        int col = idx % cols;
+        output[idx] = __hadd(output[idx], bias[col]);
+    }
+}
+
 void launch_add_bias_fp16(void* output_ptr, const void* bias_ptr, int rows, int cols) {
-    if (cols % 2 != 0) return; // 简单保护
-    half2* output = reinterpret_cast<half2*>(output_ptr);
-    const half2* bias = reinterpret_cast<const half2*>(bias_ptr);
-    int total_vec_elements = (rows * cols) / 2;
-    int width_h2 = cols / 2;
     int threads = 256;
-    int blocks = (total_vec_elements + threads - 1) / threads;
-    add_bias_fp16_vectorized<<<blocks, threads>>>(output, bias, total_vec_elements, width_h2);
+
+    if (cols % 2 == 0) {
+        half2* output = reinterpret_cast<half2*>(output_ptr);
+        const half2* bias = reinterpret_cast<const half2*>(bias_ptr);
+        int total_vec_elements = (rows * cols) / 2;
+        int width_h2 = cols / 2;
+        int blocks = (total_vec_elements + threads - 1) / threads;
+        add_bias_fp16_vectorized<<<blocks, threads>>>(output, bias, total_vec_elements, width_h2);
+    } else {
+        half* output = reinterpret_cast<half*>(output_ptr);
+        const half* bias = reinterpret_cast<const half*>(bias_ptr);
+        int total_elements = rows * cols;
+        int blocks = (total_elements + threads - 1) / threads;
+        add_bias_fp16_scalar<<<blocks, threads>>>(output, bias, total_elements, cols);
+    }
 }
