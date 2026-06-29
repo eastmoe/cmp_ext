@@ -12,6 +12,7 @@
 void launch_matmul_fp16(const void* input, const void* weight, void* output, int M, int N, int K);
 void launch_matmul_fp32(const float* input, const float* weight, float* output, int M, int N, int K);
 void launch_matmul_bf16(const void* input, const void* weight, void* output, int M, int N, int K);
+void launch_matmul_bf16_safe(const void* input, const void* weight, void* output, int M, int N, int K);
 
 // Bias Add Launchers
 void launch_add_bias_fp16(void* output, const void* bias, int rows, int cols);
@@ -155,7 +156,8 @@ std::vector<int64_t> expand_param_if_needed(py::object param) {
 torch::Tensor custom_linear_forward(
     torch::Tensor input, 
     torch::Tensor weight, 
-    c10::optional<torch::Tensor> bias) {
+    c10::optional<torch::Tensor> bias,
+    bool bf16_safe_accum) {
     
     // 1. 基础检查
     TORCH_CHECK(input.dim() >= 2, "Input dim >= 2");
@@ -205,12 +207,21 @@ torch::Tensor custom_linear_forward(
             M, N, K
         );
     } else if (input.dtype() == torch::kBFloat16) {
-        launch_matmul_bf16(
-            input.data_ptr<at::BFloat16>(), 
-            weight_t.data_ptr<at::BFloat16>(), 
-            output.data_ptr<at::BFloat16>(), 
-            M, N, K
-        );
+        if (bf16_safe_accum) {
+            launch_matmul_bf16_safe(
+                input.data_ptr<at::BFloat16>(),
+                weight_t.data_ptr<at::BFloat16>(),
+                output.data_ptr<at::BFloat16>(),
+                M, N, K
+            );
+        } else {
+            launch_matmul_bf16(
+                input.data_ptr<at::BFloat16>(),
+                weight_t.data_ptr<at::BFloat16>(),
+                output.data_ptr<at::BFloat16>(),
+                M, N, K
+            );
+        }
     } else {
         TORCH_CHECK(false, "Unsupported dtype");
     }
@@ -248,8 +259,9 @@ torch::Tensor custom_linear_forward(
 torch::Tensor custom_linear_wrapper(
     torch::Tensor input, 
     torch::Tensor weight, 
-    c10::optional<torch::Tensor> bias) {
-    return custom_linear_forward(input, weight, bias);
+    c10::optional<torch::Tensor> bias,
+    bool bf16_safe_accum) {
+    return custom_linear_forward(input, weight, bias, bf16_safe_accum);
 }
 
 
@@ -399,7 +411,7 @@ torch::Tensor custom_conv2d_forward(
         // Weight: [C_out, C_in]
         // Output: [B, H, W, C_out]
         // 注意：linear 内部会自动处理 input.contiguous() 和 weight转置
-        torch::Tensor output_nhwc = custom_linear_forward(input_nhwc, weight_flat, bias);
+        torch::Tensor output_nhwc = custom_linear_forward(input_nhwc, weight_flat, bias, false);
 
         // 4. 变换 Output: NHWC -> NCHW
         // [B, H, W, C_out] -> [B, C_out, H, W]
@@ -1578,7 +1590,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("linear", &custom_linear_wrapper, "Custom linear layer implementation",
           py::arg("input"), 
           py::arg("weight"), 
-          py::arg("bias") = py::none());
+          py::arg("bias") = py::none(),
+          py::arg("bf16_safe_accum") = false);
 
     // BMM
     m.def("bmm", &custom_bmm_forward, "Custom Batch Matrix Multiplication",

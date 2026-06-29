@@ -59,6 +59,14 @@ __device__ __forceinline__ __nv_bfloat162 half2_to_bf16x2(half2 value) {
     return __float22bfloat162_rn(__half22float2(value));
 }
 
+__device__ __forceinline__ float mul_no_fma(float a, float b) {
+    return __fmul_rn(a, b);
+}
+
+__device__ __forceinline__ float add_no_fma(float a, float b) {
+    return __fadd_rn(a, b);
+}
+
 // =========================================================================
 // 核心 Kernel (CUDA Core Native BF16)
 // =========================================================================
@@ -249,6 +257,168 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
     }
 }
 
+__global__ void __launch_bounds__(256) gemm_bf16_safe_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    int M, int N, int K,
+    int lda, int ldb, int ldc)
+{
+    __shared__ alignas(16) __nv_bfloat16 smem_a[2][BM][BK + PAD];
+    __shared__ alignas(16) __nv_bfloat16 smem_b[2][BK][BN + PAD];
+
+    float c_reg[TM][TN];
+    __nv_bfloat16 a_frag[TM];
+    __nv_bfloat16 b_frag[TN];
+
+    int4 ldg_a_reg[2];
+    int4 ldg_b_reg[2];
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            c_reg[i][j] = 0.0f;
+        }
+    }
+
+    int tid = threadIdx.x;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+
+    int ty = tid / 16;
+    int tx = tid % 16;
+
+    const __nv_bfloat16* A_ptr = A;
+    const __nv_bfloat16* B_ptr = B;
+
+    int num_tiles = (K + BK - 1) / BK;
+    int write_stage = 0;
+    int compute_stage = 0;
+
+    {
+        #pragma unroll
+        for(int i=0; i<2; ++i) {
+            int r = (tid / 4) + i * 64;
+            int c = (tid % 4) * 8;
+            int g_r = by * BM + r;
+            int g_c = c;
+
+            bool row_valid = (r < 128 && c < 32 && g_r < M);
+            int remain = K - g_c;
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+            load_gmem_vectorized(A_ptr + g_r * lda + g_c, ldg_a_reg[i], row_valid, valid_count);
+        }
+
+        #pragma unroll
+        for(int i=0; i<2; ++i) {
+            int r = (tid / 16) + i * 16;
+            int c = (tid % 16) * 8;
+            int g_r = r;
+            int g_c = bx * BN + c;
+
+            bool row_valid = (r < 32 && c < 128 && g_r < K);
+            int remain = N - g_c;
+            int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+            load_gmem_vectorized(B_ptr + g_r * ldb + g_c, ldg_b_reg[i], row_valid, valid_count);
+        }
+    }
+
+    for (int k = 0; k < num_tiles; ++k) {
+        #pragma unroll
+        for(int i=0; i<2; ++i) {
+            int r = (tid / 4) + i * 64;
+            int c = (tid % 4) * 8;
+            *reinterpret_cast<int4*>(&smem_a[write_stage][r][c]) = ldg_a_reg[i];
+        }
+        #pragma unroll
+        for(int i=0; i<2; ++i) {
+            int r = (tid / 16) + i * 16;
+            int c = (tid % 16) * 8;
+            *reinterpret_cast<int4*>(&smem_b[write_stage][r][c]) = ldg_b_reg[i];
+        }
+
+        __syncthreads();
+
+        if (k < num_tiles - 1) {
+            int next_k = (k + 1) * BK;
+
+            #pragma unroll
+            for(int i=0; i<2; ++i) {
+                int r = (tid / 4) + i * 64;
+                int c = (tid % 4) * 8;
+                int g_r = by * BM + r;
+                int g_c = next_k + c;
+
+                bool row_valid = (r < 128 && c < 32 && g_r < M);
+                int remain = K - g_c;
+                int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+                load_gmem_vectorized(A_ptr + g_r * lda + g_c, ldg_a_reg[i], row_valid, valid_count);
+            }
+
+            #pragma unroll
+            for(int i=0; i<2; ++i) {
+                int r = (tid / 16) + i * 16;
+                int c = (tid % 16) * 8;
+                int g_r = next_k + r;
+                int g_c = bx * BN + c;
+
+                bool row_valid = (r < 32 && c < 128 && g_r < K);
+                int remain = N - g_c;
+                int valid_count = remain >= 8 ? 8 : (remain > 0 ? remain : 0);
+                load_gmem_vectorized(B_ptr + g_r * ldb + g_c, ldg_b_reg[i], row_valid, valid_count);
+            }
+        }
+
+        #pragma unroll
+        for (int k_step = 0; k_step < BK; ++k_step) {
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                a_frag[i] = smem_a[compute_stage][ty * TM + i][k_step];
+            }
+
+            int4 b_vec = *reinterpret_cast<int4*>(&smem_b[compute_stage][k_step][tx * TN]);
+            __nv_bfloat16* b_ptr = reinterpret_cast<__nv_bfloat16*>(&b_vec);
+
+            #pragma unroll
+            for(int j=0; j < TN; ++j) {
+                b_frag[j] = b_ptr[j];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                float a_val = __bfloat162float(a_frag[i]);
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    float prod = mul_no_fma(a_val, __bfloat162float(b_frag[j]));
+                    c_reg[i][j] = add_no_fma(c_reg[i][j], prod);
+                }
+            }
+        }
+
+        write_stage ^= 1;
+        compute_stage ^= 1;
+        __syncthreads();
+    }
+
+    int global_row_start = by * BM + ty * TM;
+    int global_col_start = bx * BN + tx * TN;
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        int g_r = global_row_start + i;
+        if (g_r < M) {
+            #pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                int g_c = global_col_start + j;
+                if (g_c < N) {
+                    C[g_r * ldc + g_c] = __float2bfloat16_rn(c_reg[i][j]);
+                }
+            }
+        }
+    }
+}
+
 // =========================================================================
 // Matmul Launcher
 // =========================================================================
@@ -273,6 +443,30 @@ void launch_matmul_bf16(
     cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
 
     gemm_bf16_kernel<<<grid_size, block_size>>>(
+        input, weight, output, m, n, k, lda, ldb, ldc
+    );
+}
+
+void launch_matmul_bf16_safe(
+    const void* input_ptr,
+    const void* weight_ptr,
+    void* output_ptr,
+    int m, int n, int k) {
+
+    const __nv_bfloat16* input = reinterpret_cast<const __nv_bfloat16*>(input_ptr);
+    const __nv_bfloat16* weight = reinterpret_cast<const __nv_bfloat16*>(weight_ptr);
+    __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(output_ptr);
+
+    int lda = k;
+    int ldb = n;
+    int ldc = n;
+
+    dim3 block_size(256);
+    dim3 grid_size((n + BM - 1) / BM, (m + BM - 1) / BM);
+
+    cudaFuncSetAttribute(gemm_bf16_safe_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+
+    gemm_bf16_safe_kernel<<<grid_size, block_size>>>(
         input, weight, output, m, n, k, lda, ldb, ldc
     );
 }
