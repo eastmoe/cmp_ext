@@ -2,26 +2,6 @@
 #include <cuda_fp16.h>
 #include <cmath>
 
-// 辅助函数：严格遵守 Constraint 7
-// 目标：计算 1/beta
-// 要求：不要使用 FP32 的 __frcp_rn，必须转换为向量化的 FP16 使用 h2rcp
-__device__ __forceinline__ float get_strict_inv_beta(float beta) {
-    // 1. 构造向量 (Vectorize)
-    float2 beta_vec = make_float2(beta, beta);
-    
-    // 2. 转换为 FP16 向量 (half2)
-    half2 h_beta_vec = __float22half2_rn(beta_vec);
-    
-    // 3. 使用硬件 FP16 向量倒数指令
-    half2 h_rcp_vec = h2rcp(h_beta_vec);
-    
-    // 4. 转回 FP32 向量
-    float2 rcp_vec = __half22float2(h_rcp_vec);
-    
-    // 5. 返回标量结果 (取其中一个分量即可)
-    return rcp_vec.x;
-}
-
 // 标量 Softplus 核心：用于处理尾部元素
 // 严格遵守 Constraint 1, 4, 8
 __device__ __forceinline__ float softplus_scalar_strict(float x, float beta, float inv_beta, float threshold) {
@@ -92,7 +72,7 @@ __device__ __forceinline__ float2 softplus_v2_strict(float2 val, float beta, flo
 
 __global__ void softplus_kernel_fp32_opt(const float* __restrict__ input, float* __restrict__ output, int total_elements, float beta, float threshold) {
     // 预计算倒数，满足 Constraint 7
-    const float inv_beta = get_strict_inv_beta(beta);
+    const float inv_beta = __fdividef(1.0f, beta);
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;

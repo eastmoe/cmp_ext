@@ -1,12 +1,10 @@
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
-
 // ----------------------------------------------------------------------
 // FP32 Tanh Kernel
 // 约束：
 // 1. 不使用 FP32 FMA (分开 mul, add)
 // 2. 基于 exp 展开: tanh(x) = (e^(2x) - 1) / (e^(2x) + 1)
-// 3. 不使用 FP32 RCP，必须转换到 FP16 计算倒数
+// 3. 使用 rsqrtf 计算正分母倒数
 // ----------------------------------------------------------------------
 
 __global__ void tanh_kernel_fp32(const float* input, float* output, int total_elements) {
@@ -30,13 +28,7 @@ __global__ void tanh_kernel_fp32(const float* input, float* output, int total_el
         // 使用 __fadd_rn
         float denominator = __fadd_rn(exp_val, 1.0f);
 
-        // 5. 计算分母的倒数 (Constraint 7: 必须基于 FP16 计算倒数)
-        // 转换到 half
-        __half h_den = __float2half(denominator);
-        // 使用 FP16 倒数指令
-        __half h_rcp = hrcp(h_den);
-        // 转换回 float
-        float rcp_den = __half2float(h_rcp);
+        float rcp_den = rsqrtf(__fmul_rn(denominator, denominator));
 
         // 6. 计算结果: numerator * rcp_den
         // 禁止 FMA

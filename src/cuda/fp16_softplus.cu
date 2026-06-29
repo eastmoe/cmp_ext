@@ -4,7 +4,7 @@
 
 // 辅助函数：处理单个 half2 数据的 Softplus 逻辑
 // 严格遵循所有指令约束
-__device__ __forceinline__ __half2 compute_softplus_h2(__half2 v_h2, float beta, float threshold, float2 inv_beta_f2) {
+__device__ __forceinline__ __half2 compute_softplus_h2(__half2 v_h2, float beta, float threshold, float inv_beta) {
     // 1. 转为 float2 进行高精度乘法和 Exp 计算 (约束4: 禁止FP16 hexp)
     float2 v = __half22float2(v_h2);
     float2 bx;
@@ -38,9 +38,8 @@ __device__ __forceinline__ __half2 compute_softplus_h2(__half2 v_h2, float beta,
 
     float2 res_calc;
     // 约束1: 禁止 FMA，使用 __fmul_rn
-    // inv_beta_f2 已经在 Kernel 入口处通过 h2rcp 计算并转为 float
-    res_calc.x = __fmul_rn(log_val.x, inv_beta_f2.x);
-    res_calc.y = __fmul_rn(log_val.y, inv_beta_f2.y);
+    res_calc.x = __fmul_rn(log_val.x, inv_beta);
+    res_calc.y = __fmul_rn(log_val.y, inv_beta);
 
     // -------------------------------------------------------------
     // Threshold 选择逻辑
@@ -58,17 +57,7 @@ __global__ void softplus_kernel_opt_ga100(const __half* __restrict__ input,
                                           int total_elements, 
                                           float beta, 
                                           float threshold) {
-    // -------------------------------------------------------------
-    // 约束7: 禁止 FP32 __frcp_rn。计算 1/beta 必须使用 h2rcp
-    // -------------------------------------------------------------
-    // 将标量 beta 转换为 half2
-    __half2 h2_beta = __float2half2_rn(beta);
-    
-    // 使用 vector FP16 reciprocal (h2rcp)
-    __half2 h2_inv_beta = h2rcp(h2_beta);
-    
-    // 转回 float2 用于后续的高精度乘法 (根据 Softplus 公式 1/beta * log(...))
-    float2 inv_beta_f2 = __half22float2(h2_inv_beta);
+    float inv_beta = __fdividef(1.0f, beta);
 
     // -------------------------------------------------------------
     // 向量化处理 Loop (128-bit load/store)
@@ -95,7 +84,7 @@ __global__ void softplus_kernel_opt_ga100(const __half* __restrict__ input,
         // 展开循环处理 4 个 half2 (Instruction Level Parallelism)
         #pragma unroll
         for (int k = 0; k < 4; ++k) {
-            out_h2[k] = compute_softplus_h2(in_h2[k], beta, threshold, inv_beta_f2);
+            out_h2[k] = compute_softplus_h2(in_h2[k], beta, threshold, inv_beta);
         }
 
         // Store 128-bit
@@ -129,8 +118,7 @@ __global__ void softplus_kernel_opt_ga100(const __half* __restrict__ input,
             float lg = __half2float(log_res_h);
 
             // 约束1: No FMA -> __fmul_rn
-            // 使用之前 h2rcp 算出来的 inv_beta
-            res_val = __fmul_rn(lg, inv_beta_f2.x);
+            res_val = __fmul_rn(lg, inv_beta);
         }
         output[i] = __float2half(res_val);
     }

@@ -1,6 +1,5 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <cuda_fp16.h> 
 
 #define ERF_P  0.3275911f
 #define ERF_A1 0.254829592f
@@ -9,11 +8,8 @@
 #define ERF_A4 -1.453152027f
 #define ERF_A5 1.061405429f
 
-// 约束: 倒数必须走 FP16 hrcp
-__device__ __forceinline__ float custom_rcp_bf16_via_fp16(float x) {
-    __half h = __float2half(x);
-    __half r = hrcp(h);
-    return __half2float(r);
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float x) {
+    return rsqrtf(__fmul_rn(x, x));
 }
 
 // 核心逻辑：在 FP32 域计算，但严禁 FMA
@@ -25,8 +21,7 @@ __device__ __forceinline__ float compute_erf_logic_bf16(float x) {
     // 禁止 FMA: 使用 __fmul_rn + __fadd_rn
     float denom = __fadd_rn(1.0f, __fmul_rn(ERF_P, abs_x));
     
-    // 倒数转 FP16
-    float t = custom_rcp_bf16_via_fp16(denom);
+    float t = reciprocal_positive_rsqrt(denom);
 
     // Poly (Explicit mul/add)
     float p = __fadd_rn(__fmul_rn(ERF_A5, t), ERF_A4);

@@ -1,20 +1,5 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h> // 必须包含以支持 FP16 Intrinsics
-
-// 辅助函数：满足 Constraint 7
-// 不使用 FP32 的 __frcp_rn，必须转换为向量化 FP16 使用 h2rcp
-__device__ __forceinline__ float compute_rcp_fp16_vectorized(float x) {
-    // 1. 将 FP32 转换为 FP16 并复制到 high/low 两个位置构成 half2 (向量化)
-    __half2 h_x = __float2half2_rn(x);
-    // 2. 使用硬件级 FP16 向量倒数指令
-    __half2 h_rcp = h2rcp(h_x);
-    // 3. 转换回 float2
-    float2 f_rcp = __half22float2(h_rcp);
-    // 4. 返回结果 (两个通道结果相同，取其一)
-    return f_rcp.x;
-}
-
 // Warp Reduce 求和 - 严格使用 __fadd_rn 避免 FMA
 __inline__ __device__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -99,12 +84,7 @@ __global__ void rmsnorm_fp32_kernel(float* output, const float* input, const flo
     // -----------------------------------------------------------------
     __shared__ float inv_rms;
     if (tid == 0) {
-        // Constraint 7: 这里的除法 sum_sq / cols 必须处理
-        // 显式计算 rcp_cols = 1.0 / cols，使用 h2rcp
-        float rcp_cols = compute_rcp_fp16_vectorized((float)cols);
-
-        // Constraint 1: 使用 fmul 替代 fdiv/fma
-        float mean = __fmul_rn(sum_sq, rcp_cols);
+        float mean = __fdividef(sum_sq, (float)cols);
         
         // Constraint 1: 使用 fadd
         float var_eps = __fadd_rn(mean, eps);

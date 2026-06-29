@@ -1,7 +1,10 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
 #include <math.h>
+
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float x) {
+    return rsqrtf(__fmul_rn(x, x));
+}
 
 // GA100 Optimized FP32 Mish Kernel
 // 满足所有硬性指令约束
@@ -48,23 +51,6 @@ __global__ void __launch_bounds__(256) mish_kernel_ga100_opt(const float* __rest
             den[k] = __fadd_rn(term_sq, 1.0f);
         }
 
-        // Phase 2: 倒数计算 (Constraint 7: 必须转为 FP16 使用 h2rcp)
-        // 将 4 个 float 分母打包成 2 个 half2
-        float2 den_pair_0 = make_float2(den[0], den[1]);
-        float2 den_pair_1 = make_float2(den[2], den[3]);
-
-        half2 h_den_0 = __float22half2_rn(den_pair_0);
-        half2 h_den_1 = __float22half2_rn(den_pair_1);
-
-        // 使用硬件级 FP16 向量倒数
-        half2 h_rcp_0 = h2rcp(h_den_0);
-        half2 h_rcp_1 = h2rcp(h_den_1);
-
-        // 转回 FP32
-        float2 rcp_pair_0 = __half22float2(h_rcp_0);
-        float2 rcp_pair_1 = __half22float2(h_rcp_1);
-        
-        float rcp[4] = {rcp_pair_0.x, rcp_pair_0.y, rcp_pair_1.x, rcp_pair_1.y};
         float res_arr[4];
 
         // Phase 3: 最终组合
@@ -72,7 +58,7 @@ __global__ void __launch_bounds__(256) mish_kernel_ga100_opt(const float* __rest
         for (int k = 0; k < 4; ++k) {
             // Constraint 1: 使用显式 FP32 乘法
             // tanh_val = num * rcp
-            float tanh_val = __fmul_rn(num[k], rcp[k]);
+            float tanh_val = __fmul_rn(num[k], reciprocal_positive_rsqrt(den[k]));
             
             // res = x * tanh_val
             float calc_res = __fmul_rn(x[k], tanh_val);
@@ -100,13 +86,7 @@ __global__ void __launch_bounds__(256) mish_kernel_ga100_opt(const float* __rest
         float num = __fadd_rn(term_sq, -1.0f);
         float den = __fadd_rn(term_sq, 1.0f);
 
-        // 即使是标量也必须遵守 Constraint 7 使用 h2rcp
-        // 构造一个 duplicate 的 half2 来计算
-        half2 h_den = __float22half2_rn(make_float2(den, den));
-        half2 h_rcp = h2rcp(h_den);
-        float rcp = __low2float(h_rcp); // 取低位结果
-
-        float tanh_val = __fmul_rn(num, rcp);
+        float tanh_val = __fmul_rn(num, reciprocal_positive_rsqrt(den));
         float calc_res = __fmul_rn(x, tanh_val);
 
         output[i] = mask ? x : calc_res;

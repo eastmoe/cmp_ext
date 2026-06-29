@@ -156,17 +156,14 @@ __global__ void GroupNormKernelFP16(
     // =========================================================
     // 4. 计算参数 (Mean, Rstd) - 遵守指令约束
     // =========================================================
-    // 约束7: 禁止 __frcp_rn。这里使用标准除法 /，编译器会生成 fdiv_rn (允许)。
-    // 只有在显式求倒数时才受限。
-    
-    float mean = s_stats.x / num_elements_in_group;
+    float mean = __fdividef(s_stats.x, (float)num_elements_in_group);
     // var = E[x^2] - E[x]^2. 禁止 FMA -> 使用 mul_rn 和 sub_rn
     float mean_sq = mul_rn(mean, mean);
-    float avg_sq = s_stats.y / num_elements_in_group;
+    float avg_sq = __fdividef(s_stats.y, (float)num_elements_in_group);
     float var = sub_rn(avg_sq, mean_sq);
     
     // rsqrtf 是允许的
-    float rstd = rsqrtf(max(var, 0.0f) + eps);
+    float rstd = rsqrtf(add_rn(fmaxf(var, 0.0f), eps));
 
     // =========================================================
     // 5. 第二遍：归一化 (利用 FP16 FMA __hfma2)

@@ -4,7 +4,7 @@
 // 简单的 Warp 规约求和
 __inline__ __device__ float warpReduceSum(float val) {
     for (int offset = warpSize / 2; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val = __fadd_rn(val, __shfl_down_sync(0xffffffff, val, offset));
     return val;
 }
 
@@ -53,8 +53,8 @@ __global__ void layernorm_fp32_kernel(
     // 1. 计算均值 (Mean) 和 平方和
     for (int i = tid; i < cols; i += blockDim.x) {
         float val = row_input[i];
-        sum += val;
-        sum_sq += val * val;
+        sum = __fadd_rn(sum, val);
+        sum_sq = __fadd_rn(sum_sq, __fmul_rn(val, val));
     }
 
     sum = blockReduceSum(sum);
@@ -64,23 +64,26 @@ __global__ void layernorm_fp32_kernel(
     __shared__ float s_var;
 
     if (tid == 0) {
-        s_mean = sum / cols;
+        s_mean = __fdividef(sum, (float)cols);
         // Var = E[X^2] - (E[X])^2
-        s_var = (sum_sq / cols) - (s_mean * s_mean);
+        float avg_sq = __fdividef(sum_sq, (float)cols);
+        float mean_sq = __fmul_rn(s_mean, s_mean);
+        s_var = __fsub_rn(avg_sq, mean_sq);
         // 防止精度问题导致的负方差
         if (s_var < 0.0f) s_var = 0.0f;
     }
     __syncthreads();
 
     float mean = s_mean;
-    float inv_std = rsqrtf(s_var + eps);
+    float inv_std = rsqrtf(__fadd_rn(s_var, eps));
 
     // 2. 归一化并应用 Gamma/Beta
     for (int i = tid; i < cols; i += blockDim.x) {
-        float val = (row_input[i] - mean) * inv_std;
+        float diff = __fsub_rn(row_input[i], mean);
+        float val = __fmul_rn(diff, inv_std);
         
-        if (gamma != nullptr) val *= gamma[i];
-        if (beta != nullptr) val += beta[i];
+        if (gamma != nullptr) val = __fmul_rn(val, gamma[i]);
+        if (beta != nullptr) val = __fadd_rn(val, beta[i]);
         
         row_output[i] = val;
     }

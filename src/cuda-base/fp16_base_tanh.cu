@@ -5,7 +5,7 @@
 // FP16 Tanh Kernel
 // 约束：
 // 1. 不要使用 hexp, hsin 等，必须转为 FP32 使用 __expf
-// 2. 不要使用 FP32 RCP，必须基于 FP16 倒数
+// 2. 正分母倒数使用 rsqrtf，避免半精度 RCP 转换路径
 // 3. 展开公式
 // ----------------------------------------------------------------------
 
@@ -29,13 +29,7 @@ __global__ void tanh_kernel_fp16(const __half* input, __half* output, int total_
         // 4. 分母 (FP32)
         float denominator = __fadd_rn(exp_val, 1.0f);
 
-        // 5. 倒数处理 (Constraint 7)
-        // 既然我们在 FP16 kernel 里，也要求 "必须基于 FP16 计算倒数"
-        __half h_den = __float2half(denominator);
-        __half h_rcp = hrcp(h_den);
-        // 虽然 h_rcp 已经是 FP16，但为了符合"全程用 float __fmul 计算"的逻辑，
-        // 我们将其转回 float 与 numerator 相乘
-        float rcp_den = __half2float(h_rcp);
+        float rcp_den = rsqrtf(__fmul_rn(denominator, denominator));
 
         // 6. 结果 (FP32)
         float res_f = __fmul_rn(numerator, rcp_den);

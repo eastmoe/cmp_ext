@@ -48,7 +48,8 @@ __global__ void conv_transpose2d_bf16_kernel(
                             
                             float val_in = __bfloat162float(input[in_idx]);
                             float val_w = __bfloat162float(weight[w_idx]);
-                            sum += val_in * val_w;
+                            float prod = __fmul_rn(val_in, val_w);
+                            sum = __fadd_rn(sum, prod);
                         }
                     }
                 }

@@ -4,7 +4,7 @@
 // 复用 FP32 的规约逻辑，因为我们在 FP16 Kernel 中内部也使用 float 累加
 __inline__ __device__ float warpReduceSum(float val) {
     for (int offset = warpSize / 2; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val = __fadd_rn(val, __shfl_down_sync(0xffffffff, val, offset));
     return val;
 }
 
@@ -45,8 +45,8 @@ __global__ void layernorm_fp16_kernel(
     // 1. 读取并转换为 float 进行统计
     for (int i = tid; i < cols; i += blockDim.x) {
         float val = __half2float(row_input[i]);
-        sum += val;
-        sum_sq += val * val;
+        sum = __fadd_rn(sum, val);
+        sum_sq = __fadd_rn(sum_sq, __fmul_rn(val, val));
     }
 
     sum = blockReduceSum(sum);
@@ -56,11 +56,13 @@ __global__ void layernorm_fp16_kernel(
     __shared__ float s_inv_std;
 
     if (tid == 0) {
-        float mean = sum / cols;
-        float var = (sum_sq / cols) - (mean * mean);
+        float mean = __fdividef(sum, (float)cols);
+        float avg_sq = __fdividef(sum_sq, (float)cols);
+        float mean_sq = __fmul_rn(mean, mean);
+        float var = __fsub_rn(avg_sq, mean_sq);
         if (var < 0.0f) var = 0.0f;
         s_mean = mean;
-        s_inv_std = rsqrtf(var + eps);
+        s_inv_std = rsqrtf(__fadd_rn(var, eps));
     }
     __syncthreads();
 
@@ -70,10 +72,10 @@ __global__ void layernorm_fp16_kernel(
     // 2. 归一化并转回 half
     for (int i = tid; i < cols; i += blockDim.x) {
         float val = __half2float(row_input[i]);
-        val = (val - mean) * inv_std;
+        val = __fmul_rn(__fsub_rn(val, mean), inv_std);
 
-        if (gamma != nullptr) val *= __half2float(gamma[i]);
-        if (beta != nullptr) val += __half2float(beta[i]);
+        if (gamma != nullptr) val = __fmul_rn(val, __half2float(gamma[i]));
+        if (beta != nullptr) val = __fadd_rn(val, __half2float(beta[i]));
 
         row_output[i] = __float2half(val);
     }

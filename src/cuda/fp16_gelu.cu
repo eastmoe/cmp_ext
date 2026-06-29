@@ -6,15 +6,8 @@
 // B = A * 0.044715 = 0.071354814
 
 __global__ void gelu_fp16_optimized_kernel(const half* __restrict__ input, half* __restrict__ output, int n) {
-    // 定义 FP16 vector 常量
-    const half2 kA = __float2half2_rn(1.595769122f);
-    const half2 kB = __float2half2_rn(0.071354815f);
-    const half2 kOne = __float2half2_rn(1.0f);
-
-    // 定义 Scalar 常量 (用于处理尾部)
-    const half kA_s = __float2half(1.595769122f);
-    const half kB_s = __float2half(0.071354815f);
-    const half kOne_s = __float2half(1.0f);
+    const float kA = 1.595769122f;
+    const float kB = 0.071354815f;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -36,36 +29,22 @@ __global__ void gelu_fp16_optimized_kernel(const half* __restrict__ input, half*
             for (int k = 0; k < 4; ++k) {
                 half2 x = h2_data[k];
 
-                // 计算多项式 z = 2 * sqrt(2/pi) * (x + 0.044715 * x^3)
-                // 变形为: z = x * (kA + kB * x^2)
-                
-                half2 x2 = __hmul2(x, x);
-                // 使用 FP16 FMA: kB * x2 + kA
-                half2 poly = __hfma2(kB, x2, kA); 
-                half2 z = __hmul2(x, poly);
+                float2 xf = __half22float2(x);
+                float2 out;
 
-                // 我们需要计算 Sigmoid(z) = 1 / (1 + exp(-z))
-                // 取负号: -z
-                half2 neg_z = __hneg2(z);
+                float x2_l = __fmul_rn(xf.x, xf.x);
+                float poly_l = __fadd_rn(kA, __fmul_rn(kB, x2_l));
+                float z_l = __fmul_rn(xf.x, poly_l);
+                float den_l = __fadd_rn(1.0f, __expf(__fmul_rn(z_l, -1.0f)));
+                out.x = __fmul_rn(xf.x, rsqrtf(__fmul_rn(den_l, den_l)));
 
-                // Constraint 4: 必须转换为 FP32 使用 __expf
-                float2 f_z = __half22float2(neg_z);
-                
-                // 对两个分量分别计算 expf
-                f_z.x = __expf(f_z.x);
-                f_z.y = __expf(f_z.y);
+                float x2_h = __fmul_rn(xf.y, xf.y);
+                float poly_h = __fadd_rn(kA, __fmul_rn(kB, x2_h));
+                float z_h = __fmul_rn(xf.y, poly_h);
+                float den_h = __fadd_rn(1.0f, __expf(__fmul_rn(z_h, -1.0f)));
+                out.y = __fmul_rn(xf.y, rsqrtf(__fmul_rn(den_h, den_h)));
 
-                // 转换回 FP16
-                half2 exp_val = __float22half2_rn(f_z);
-
-                // den = 1.0 + exp_val
-                half2 den = __hadd2(kOne, exp_val);
-
-                // Constraint 7: 必须使用 FP16 h2rcp，不能用 FP32 倒数
-                half2 inv_den = h2rcp(den);
-
-                // result = x * inv_den
-                res[k] = __hmul2(x, inv_den);
+                res[k] = __float22half2_rn(out);
             }
 
             // Store 128-bit
@@ -77,24 +56,12 @@ __global__ void gelu_fp16_optimized_kernel(const half* __restrict__ input, half*
             for (int j = i; j < n; ++j) {
                 half x = input[j];
                 
-                // Scalar math mirroring the vector logic
-                half x2 = __hmul(x, x);
-                half poly = __hfma(kB_s, x2, kA_s);
-                half z = __hmul(x, poly);
-                
-                half neg_z = __hneg(z);
-                
-                // Constriant 4: Convert to FP32 for exp
-                float f_z = __half2float(neg_z);
-                float f_exp = __expf(f_z);
-                half h_exp = __float2half(f_exp);
-                
-                half den = __hadd(kOne_s, h_exp);
-                
-                // Constraint 7: Use FP16 rcp
-                half inv_den = hrcp(den);
-                
-                output[j] = __hmul(x, inv_den);
+                float xf = __half2float(x);
+                float x2 = __fmul_rn(xf, xf);
+                float poly = __fadd_rn(kA, __fmul_rn(kB, x2));
+                float z = __fmul_rn(xf, poly);
+                float den = __fadd_rn(1.0f, __expf(__fmul_rn(z, -1.0f)));
+                output[j] = __float2half(__fmul_rn(xf, rsqrtf(__fmul_rn(den, den))));
             }
         }
     }

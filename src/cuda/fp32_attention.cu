@@ -1,7 +1,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h> 
 #include <algorithm>
 #include <cstdint> 
 
@@ -12,24 +11,8 @@ __device__ __forceinline__ float4 load_float4(const float* ptr) {
     return *reinterpret_cast<const float4*>(ptr);
 }
 
-// 【关键修复】
-// 满足要求7：通过FP16计算倒数
-// 修复说明：
-// 之前的内联汇编 rcp.approx.f16 在 sm_80 架构下导致 ptxas 报错 "Unexpected instruction types"。
-// 现改为使用 CUDA 标准内置函数 __hdiv 计算 (1.0h / x_h)。
-// 1. 仍然完全在 FP16 域内执行倒数计算，满足精度和逻辑要求。
-// 2. 避免了手写 PTX 带来的寄存器类型兼容性问题。
-__device__ __forceinline__ float fp32_rcp_via_fp16(float x) {
-    // 1. Float -> Half (使用 _rn 版本确保明确)
-    __half h_x = __float2half_rn(x);
-    
-    // 2. 在 FP16 精度下计算倒数 (1.0 / x)
-    // __hdiv 是 device intrinsic，确保生成半精度除法指令
-    __half h_one = __float2half_rn(1.0f);
-    __half h_res = __hdiv(h_one, h_x);
-    
-    // 3. Half -> Float
-    return __half2float(h_res);
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float x) {
+    return rsqrtf(__fmul_rn(x, x));
 }
 
 __global__ void attention_fp32_strict_kernel(
@@ -140,13 +123,13 @@ __global__ void attention_fp32_strict_kernel(
                 // m_new = fmaxf(m_i, dot);
                 float m_new = fmaxf(m_i, dot);
                 
-                // exp_diff = expf(m_i - m_new);
+                // exp_diff = __expf(m_i - m_new);
                 // 【要求1】减法使用 __fsub_rn
                 // 【要求4】使用 __expf (FP32)
                 float diff_m = __fsub_rn(m_i, m_new);
                 float exp_diff = __expf(diff_m);
 
-                // exp_val = expf(dot - m_new);
+                // exp_val = __expf(dot - m_new);
                 float diff_d = __fsub_rn(dot, m_new);
                 float exp_val = __expf(diff_d);
 
@@ -173,11 +156,8 @@ __global__ void attention_fp32_strict_kernel(
 
     // 3. 最终写回
     if (is_valid_q) {
-        // float inv_l = 1.0f / (l_i + 1e-6f);
-        // 【要求7】禁止 FP32 div/rcp，使用 helper (转FP16->rcp->转FP32)
-        // 加上 epsilon 防止除零 (FP32 加法)
         float l_sum = __fadd_rn(l_i, 1e-6f);
-        float inv_l = fp32_rcp_via_fp16(l_sum);
+        float inv_l = reciprocal_positive_rsqrt(l_sum);
 
         for (int i = 0; i < D; i+=4) {
              if (i + 3 < D) {

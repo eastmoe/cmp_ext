@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(256) conv2d_fp32_kernel_ampere_opt_v2(
 
                 // 计算 & 累加
                 // GA100 L1 Cache 会广播 w_val 给 Warp 中的所有线程
-                // 关键点：这里 w_val 读取一次，被 2 次 FMA 使用 (Reuse)
+                // 显式拆分 FP32 MUL + ADD，避免 FMA
                 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
                     // 直接使用指针解引用，然后自增
@@ -129,9 +129,10 @@ __global__ void __launch_bounds__(256) conv2d_fp32_kernel_ampere_opt_v2(
                     float w_val = *w_ptrs[k];
                     w_ptrs[k]++; // 指针推进到下一个 (i, j) 或下一个 c_in
 
-                    // FMA 指令
-                    sum0[k] += in_val0 * w_val;
-                    sum1[k] += in_val1 * w_val;
+                    float prod0 = __fmul_rn(in_val0, w_val);
+                    float prod1 = __fmul_rn(in_val1, w_val);
+                    sum0[k] = __fadd_rn(sum0[k], prod0);
+                    sum1[k] = __fadd_rn(sum1[k], prod1);
                 }
             }
         }
@@ -153,7 +154,7 @@ __global__ void __launch_bounds__(256) conv2d_fp32_kernel_ampere_opt_v2(
             int current_c_out = c_out_base + k;
             if (current_c_out < C_out) {
                 float val = acc[k];
-                if (bias) val += bias[current_c_out];
+                if (bias) val = __fadd_rn(val, bias[current_c_out]);
                 
                 long long out_addr = out_batch_offset + (long long)current_c_out * total_pixels + out_spatial;
                 output[out_addr] = val;

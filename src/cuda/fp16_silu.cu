@@ -5,53 +5,25 @@
 // 约束遵循：
 // 1. 不使用 h2exp，转换为 float 后使用 __expf
 // 2. 不使用 FP32 FMA
-// 3. 使用 h2rcp
+// 3. 使用 rsqrtf 计算正分母倒数，避免半精度 RCP
 __device__ __forceinline__ __half2 silu_h2_opt(const __half2 x) {
-    // 1. 在 FP16 域计算 -x (A100 FP16吞吐量高)
-    __half2 neg_x = __hneg2(x);
-    
-    // 2. [约束4] 必须转换为 FP32 使用 __expf
-    float2 f2_in = __half22float2(neg_x);
-    
-    // 分别计算两个分量的 exp
-    f2_in.x = __expf(f2_in.x);
-    f2_in.y = __expf(f2_in.y);
-    
-    // 转换回 half2
-    __half2 e_neg_x = __float22half2_rn(f2_in);
-    
-    // 3. 计算 1 + exp(-x)
-    // 使用 FP16 加法，避免 FP32 FMA 风险且利用双倍吞吐
-    const __half2 one = __float2half2_rn(1.0f);
-    __half2 den = __hadd2(one, e_neg_x);
-    
-    // 4. [约束7] 计算 1 / (1 + exp(-x)) -> sigmoid(x)
-    // 必须使用向量化的 h2rcp
-    __half2 sig = h2rcp(den);
-    
-    // 5. 结果 = x * sigmoid(x)
-    // 使用 FP16 乘法，不涉及 FP32 FMA
-    return __hmul2(x, sig);
+    float2 xf = __half22float2(x);
+    float2 res;
+
+    float den_x = __fadd_rn(1.0f, __expf(-xf.x));
+    float den_y = __fadd_rn(1.0f, __expf(-xf.y));
+    res.x = __fmul_rn(xf.x, rsqrtf(__fmul_rn(den_x, den_x)));
+    res.y = __fmul_rn(xf.y, rsqrtf(__fmul_rn(den_y, den_y)));
+
+    return __float22half2_rn(res);
 }
 
 // 辅助函数：计算标量 half 的 silu (用于处理边界)
 __device__ __forceinline__ __half silu_h1_opt(const __half x) {
-    // FP16 负号
-    __half neg_x = __hneg(x);
-    
-    // [约束4] 转 FP32 计算 exp
-    float f_in = __half2float(neg_x);
-    float f_exp = __expf(f_in);
-    __half e_neg_x = __float2half_rn(f_exp);
-    
-    // FP16 加法
-    const __half one = __float2half_rn(1.0f);
-    __half den = __hadd(one, e_neg_x);
-    
-    // [约束7] 使用 hrcp
-    __half sig = hrcp(den);
-    
-    return __hmul(x, sig);
+    float xf = __half2float(x);
+    float den = __fadd_rn(1.0f, __expf(-xf));
+    float res = __fmul_rn(xf, rsqrtf(__fmul_rn(den, den)));
+    return __float2half(res);
 }
 
 __global__ void silu_kernel_fp16_optimized(const __half* input, __half* output, int n) {

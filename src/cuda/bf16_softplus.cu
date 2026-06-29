@@ -6,13 +6,14 @@ __global__ void softplus_kernel_bf16(const __nv_bfloat16* input, __nv_bfloat16* 
     if (idx < total_elements) {
         // 为了计算简单和精度，先转为 float 计算
         float x = __bfloat162float(input[idx]);
-        float bx = x * beta;
+        float bx = __fmul_rn(x, beta);
         
         float val;
         if (bx > threshold) {
             val = x;
         } else {
-            val = logf(1.0f + expf(bx)) / beta;
+            float term = __fadd_rn(1.0f, __expf(bx));
+            val = __fdividef(logf(term), beta);
         }
         output[idx] = __float2bfloat16(val);
     }

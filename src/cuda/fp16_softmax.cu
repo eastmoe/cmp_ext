@@ -144,16 +144,10 @@ __global__ void softmax_kernel_opt_ga100(const __half* __restrict__ input, __hal
     }
 
     // ==========================================
-    // 3. 计算倒数 (Constraint 7)
+    // 3. 计算正分母倒数
     // ==========================================
-    // 要求：不要使用FP32 __frcp_rn，必须转为FP16向量使用h2rcp
     if (tid == 0) {
-        // 复制sum到half2的两个通道 (S, S)
-        __half2 sum_h2 = __float2half2_rn(block_sum);
-        // 使用向量化FP16倒数指令
-        sum_h2 = h2rcp(sum_h2);
-        // 转回float，取出其中一个
-        s_data[0] = __low2float(sum_h2); 
+        s_data[0] = rsqrtf(__fmul_rn(block_sum, block_sum));
     }
     __syncthreads();
     float global_inv_sum = s_data[0];

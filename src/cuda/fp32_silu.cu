@@ -1,13 +1,16 @@
 #include <cuda_runtime.h>
-#include <cuda_fp16.h> // 必须引入，用于 half2 和 h2rcp 指令
 #include <cmath>
 #include <cstdint>     // 修复：包含 uintptr_t
+
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float x) {
+    return rsqrtf(__fmul_rn(x, x));
+}
 
 // 辅助函数：计算单个 float4 向量的 SiLU
 // 优化策略：
 // 1. 使用 __expf (FP32)
 // 2. 避免 FP32 FMA，使用 __fadd_rn / __fmul_rn
-// 3. 倒数计算使用 FP16 向量化 h2rcp
+// 3. 正分母倒数使用 rsqrtf，避免半精度 RCP 转换路径
 __device__ __forceinline__ float4 silu_vec4(float4 v) {
     float4 res;
 
@@ -20,27 +23,12 @@ __device__ __forceinline__ float4 silu_vec4(float4 v) {
     float d_z = __fadd_rn(1.0f, __expf(-v.z));
     float d_w = __fadd_rn(1.0f, __expf(-v.w));
 
-    // --- 步骤 2: 计算倒数 (1 / d)，利用 vectorized FP16 ---
-    // 约束 7: 禁止 FP32 __frcp_rn，必须转为 FP16 使用 h2rcp
-    
-    // 将 4 个 FP32 分母打包为 2 个 FP16x2 (half2)
-    __half2 h2_0 = __float22half2_rn(make_float2(d_x, d_y));
-    __half2 h2_1 = __float22half2_rn(make_float2(d_z, d_w));
-
-    // 使用硬件级 FP16 向量倒数指令
-    h2_0 = h2rcp(h2_0);
-    h2_1 = h2rcp(h2_1);
-
-    // 将结果解包回 FP32
-    float2 r_0 = __half22float2(h2_0);
-    float2 r_1 = __half22float2(h2_1);
-
-    // --- 步骤 3: 最终乘法 (x * rcp)，保持 FP32 ---
+    // --- 步骤 2: 最终乘法 (x * (1 / d))，保持 FP32 ---
     // 约束 1: 使用 __fmul_rn 避免 FMA
-    res.x = __fmul_rn(v.x, r_0.x);
-    res.y = __fmul_rn(v.y, r_0.y);
-    res.z = __fmul_rn(v.z, r_1.x);
-    res.w = __fmul_rn(v.w, r_1.y);
+    res.x = __fmul_rn(v.x, reciprocal_positive_rsqrt(d_x));
+    res.y = __fmul_rn(v.y, reciprocal_positive_rsqrt(d_y));
+    res.z = __fmul_rn(v.z, reciprocal_positive_rsqrt(d_z));
+    res.w = __fmul_rn(v.w, reciprocal_positive_rsqrt(d_w));
 
     return res;
 }
@@ -50,18 +38,8 @@ __device__ __forceinline__ float silu_scalar(float x) {
     // 约束 4 & 1: FP32 exp 和 add
     float denom = __fadd_rn(1.0f, __expf(-x));
 
-    // 约束 7: 即使是标量，也按要求转换为 FP16 使用 h2rcp
-    // 构造 half2，第二个元素填充 1.0 或重复 denom 均可，这里重复 denom 以利用 SIMD
-    __half2 h_denom = __float22half2_rn(make_float2(denom, denom));
-    
-    // 计算向量倒数
-    h_denom = h2rcp(h_denom);
-    
-    // 取回低位 float
-    float rcp_val = __low2float(h_denom);
-
     // 约束 1: FP32 mul
-    return __fmul_rn(x, rcp_val);
+    return __fmul_rn(x, reciprocal_positive_rsqrt(denom));
 }
 
 __global__ void silu_kernel_fp32(const float* input, float* output, int n) {

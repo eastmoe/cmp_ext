@@ -15,8 +15,8 @@ __global__ void upsample_nearest_fp16_kernel_optimized_v3(
     int total_rows = B * C * H_out;
     int row_idx = blockIdx.x * blockDim.y + threadIdx.y; // 如果你改变了 block 维度，这里要注意，但在 grid-stride loop 中通常只用 blockIdx.x
 
-    const float height_scale = (float)H_in / (float)H_out;
-    const float width_scale  = (float)W_in / (float)W_out;
+    const float height_scale = __fdividef((float)H_in, (float)H_out);
+    const float width_scale  = __fdividef((float)W_in, (float)W_out);
 
     // 检查对齐：基地址16字节对齐 且 宽度是8的倍数
     bool is_aligned = ((uintptr_t)output % 16 == 0) && (W_out % 8 == 0);

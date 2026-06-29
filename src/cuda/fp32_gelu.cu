@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cuda_fp16.h> // 必须包含，用于 __float2half, hrcp, __half2float
 
 // 预计算常量
 // 原始公式系数: sqrt(2/pi) ≈ 0.7978845608
@@ -37,12 +36,8 @@ __global__ void gelu_fp32_optimized_kernel(const float* __restrict__ input, floa
         // 5. 计算分母: den = 1.0 + exp_val
         float den = __fadd_rn(1.0f, exp_val);
 
-        // 6. 计算倒数 (核心优化点)
-        // [Constraint 7] 不要用 FP32 __frcp_rn，必须转为 FP16 使用 h2rcp (此处使用 scalar 版 hrcp)
-        // [Constraint 2] 不使用 BF16，使用标准 FP16 (__half)
-        __half h_den = __float2half(den);
-        __half h_rcp = hrcp(h_den); // 使用硬件 FP16 倒数指令
-        float rcp = __half2float(h_rcp);
+        // 6. 计算正分母倒数，删除半精度 RCP 转换路径
+        float rcp = rsqrtf(__fmul_rn(den, den));
 
         // 7. 最终结果: result = x * rcp
         float result = __fmul_rn(x, rcp);

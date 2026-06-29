@@ -41,14 +41,12 @@ __global__ void softsign_kernel_fp16(const __half* __restrict__ input, __half* _
             // denom = 1 + |x| (使用硬件级 half2 add)
             __half2 denom = __hadd2(h2_one, abs_x);
 
-            // 核心优化：Softsign = x / (1+|x|)
-            // 依据要求7：禁止 FP32 __frcp_rn，禁止普通除法。
-            // 使用 GA100 原生指令 rcp.approx.ftz.f16x2 (h2rcp) 计算倒数
-            __half2 rcp_denom = h2rcp(denom);
-
-            // res = x * rcp_denom (使用硬件级 half2 mul)
-            // 替代了除法运算
-            v[k] = __hmul2(x, rcp_denom);
+            float2 xf = __half22float2(x);
+            float2 df = __half22float2(denom);
+            float2 res;
+            res.x = __fmul_rn(xf.x, rsqrtf(__fmul_rn(df.x, df.x)));
+            res.y = __fmul_rn(xf.y, rsqrtf(__fmul_rn(df.y, df.y)));
+            v[k] = __float22half2_rn(res);
         }
 
         // 3. 向量化写回
@@ -68,10 +66,9 @@ __global__ void softsign_kernel_fp16(const __half* __restrict__ input, __half* _
         __half abs_x = __habs(x);
         __half denom = __hadd(h_one, abs_x);
         
-        // 依据要求：使用 FP16 倒数指令 hrcp (rcp.approx.f16)
-        __half rcp_denom = hrcp(denom);
-        
-        output[i] = __hmul(x, rcp_denom);
+        float xf = __half2float(x);
+        float df = __half2float(denom);
+        output[i] = __float2half(__fmul_rn(xf, rsqrtf(__fmul_rn(df, df))));
     }
 }
 

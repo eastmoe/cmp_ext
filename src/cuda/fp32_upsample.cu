@@ -18,8 +18,8 @@ __global__ void upsample_nearest_fp32_kernel(
 
         // 映射到输入坐标 (最近邻)
         // src = floor(dst * scale)
-        const float height_scale = (float)H_in / (float)H_out;
-        const float width_scale = (float)W_in / (float)W_out;
+        const float height_scale = __fdividef((float)H_in, (float)H_out);
+        const float width_scale = __fdividef((float)W_in, (float)W_out);
 
         // 使用 min 确保不越界 (虽然理论上 floor 不会越界，但在边界值时浮点精度需小心)
         int h_in_idx = min((int)(h_out_idx * height_scale), H_in - 1);

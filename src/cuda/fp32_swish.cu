@@ -1,13 +1,16 @@
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
 #include <math.h>
 
 // GA100 Optimization for Swish
 // Constraints Applied:
 // 1. No FP32 FMA -> explicit __fmul_rn, __fadd_rn
-// 2. FP16 Vectorized Reciprocal -> float2half2 -> __h2rcp -> half22float
+// 2. Positive reciprocal -> rsqrtf(d*d)
 // 3. No FP16 exp/trig -> use FP32 __expf
 // 4. Vectorized IO -> float4
+
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float x) {
+    return rsqrtf(__fmul_rn(x, x));
+}
 
 __global__ void __launch_bounds__(256) swish_kernel_opt_ga100(
     const float* __restrict__ input, 
@@ -56,29 +59,12 @@ __global__ void __launch_bounds__(256) swish_kernel_opt_ga100(
         float d_z = __fadd_rn(1.0f, e_z);
         float d_w = __fadd_rn(1.0f, e_w);
 
-        // Step 4: Compute Reciprocal using Vectorized FP16 (Constraint 7)
-        // Forbidden: __frcp_rn, __fdividef
-        // Required: Convert to FP16 -> h2rcp -> Convert back
-        
-        // Pack floats into half2 vectors
-        // make_float2 is a helper to construct the vector for conversion
-        __half2 h2_xy = __float22half2_rn(make_float2(d_x, d_y));
-        __half2 h2_zw = __float22half2_rn(make_float2(d_z, d_w));
-
-        // Execute Hardware Vectorized Reciprocal
-        h2_xy = h2rcp(h2_xy);
-        h2_zw = h2rcp(h2_zw);
-
-        // Unpack back to FP32
-        float2 rcp_xy = __half22float2(h2_xy);
-        float2 rcp_zw = __half22float2(h2_zw);
-
-        // Step 5: Final Multiply (x * rcp)
+        // Step 4: Final Multiply (x * reciprocal)
         // Constraint 1: Must split FMA. Using __fmul_rn.
-        r.x = __fmul_rn(v.x, rcp_xy.x);
-        r.y = __fmul_rn(v.y, rcp_xy.y);
-        r.z = __fmul_rn(v.z, rcp_zw.x);
-        r.w = __fmul_rn(v.w, rcp_zw.y);
+        r.x = __fmul_rn(v.x, reciprocal_positive_rsqrt(d_x));
+        r.y = __fmul_rn(v.y, reciprocal_positive_rsqrt(d_y));
+        r.z = __fmul_rn(v.z, reciprocal_positive_rsqrt(d_z));
+        r.w = __fmul_rn(v.w, reciprocal_positive_rsqrt(d_w));
 
         // Vector Store
         out_vec[i] = r;
@@ -100,18 +86,7 @@ __global__ void __launch_bounds__(256) swish_kernel_opt_ga100(
         // FP32 Add
         float d = __fadd_rn(1.0f, e);
 
-        // Constraint 7: Must use vectorized h2rcp even for scalar logic
-        // Pack scalar 'd' into low part of half2, high part dummy (1.0)
-        __half2 h2_scalar = __float22half2_rn(make_float2(d, 1.0f));
-        
-        // Vectorized Reciprocal
-        h2_scalar = h2rcp(h2_scalar);
-        
-        // Convert back
-        float2 rcp_res = __half22float2(h2_scalar);
-        
-        // FP32 Mul (x * rcp) using the low part (x)
-        output[i] = __fmul_rn(x, rcp_res.x);
+        output[i] = __fmul_rn(x, reciprocal_positive_rsqrt(d));
     }
 }
 

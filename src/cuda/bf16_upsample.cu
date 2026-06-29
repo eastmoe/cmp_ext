@@ -16,8 +16,8 @@ __global__ void upsample_nearest_bf16_kernel(
         int c_idx     = (index / (W_out * H_out)) % C;
         int b_idx     = index / (W_out * H_out * C);
 
-        const float height_scale = (float)H_in / (float)H_out;
-        const float width_scale = (float)W_in / (float)W_out;
+        const float height_scale = __fdividef((float)H_in, (float)H_out);
+        const float width_scale = __fdividef((float)W_in, (float)W_out);
 
         int h_in_idx = min((int)(h_out_idx * height_scale), H_in - 1);
         int w_in_idx = min((int)(w_out_idx * width_scale), W_in - 1);

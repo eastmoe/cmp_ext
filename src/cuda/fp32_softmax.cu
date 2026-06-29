@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>  // 必须包含，用于 half2 和 __h2rcp
 #include <algorithm>
 #include <cmath>
 
@@ -22,20 +21,8 @@ __device__ __forceinline__ float mul_strict(float a, float b) {
     return __fmul_rn(a, b);
 }
 
-// 约束 7: 必须转换为 FP16 使用 h2rcp 算完再转换回去
-// 解决方案: 使用向量化指令 __floats2half2_rn 和 h2rcp
-__device__ __forceinline__ float rcp_via_h2rcp(float x) {
-    // 1. 将 FP32 标量 x 复制两份，转换为 half2 (Packed FP16)
-    // 对应指令: cvt.rn.f16x2.f32
-    __half2 h2_val = __floats2half2_rn(x, x);
-    
-    // 2. 使用硬件 FP16 向量倒数指令
-    // 对应指令: rcp.approx.f16x2
-    __half2 h2_res = h2rcp(h2_val);
-    
-    // 3. 取低位 FP16 转回 FP32
-    // 对应指令: cvt.f32.f16
-    return __low2float(h2_res);
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float x) {
+    return rsqrtf(__fmul_rn(x, x));
 }
 
 // ==========================================
@@ -129,15 +116,15 @@ __global__ void softmax_kernel_fp32_opt(const float* __restrict__ input, float* 
     for (int i = tid; i < vec_cols; i += blockDim.x) {
         float4 v = reinterpret_cast<const float4*>(row_input)[i];
         // Strict Math: add(sum, exp(sub(x, max)))
-        local_sum = add_strict(local_sum, expf(sub_strict(v.x, global_max)));
-        local_sum = add_strict(local_sum, expf(sub_strict(v.y, global_max)));
-        local_sum = add_strict(local_sum, expf(sub_strict(v.z, global_max)));
-        local_sum = add_strict(local_sum, expf(sub_strict(v.w, global_max)));
+        local_sum = add_strict(local_sum, __expf(sub_strict(v.x, global_max)));
+        local_sum = add_strict(local_sum, __expf(sub_strict(v.y, global_max)));
+        local_sum = add_strict(local_sum, __expf(sub_strict(v.z, global_max)));
+        local_sum = add_strict(local_sum, __expf(sub_strict(v.w, global_max)));
     }
     // Scalar Loop
     for (int i = vec_cols * 4 + tid; i < cols; i += blockDim.x) {
         float val = row_input[i];
-        local_sum = add_strict(local_sum, expf(sub_strict(val, global_max)));
+        local_sum = add_strict(local_sum, __expf(sub_strict(val, global_max)));
     }
 
     // Warp Reduce
@@ -158,10 +145,9 @@ __global__ void softmax_kernel_fp32_opt(const float* __restrict__ input, float* 
     global_sum = s_mem[0];
 
     // ---------------------------------------------------
-    // Step 3: Compute Reciprocal (Constraint 7 Fix)
+    // Step 3: Compute Reciprocal
     // ---------------------------------------------------
-    // 使用 FP16 向量化指令计算倒数
-    float inv_global_sum = rcp_via_h2rcp(global_sum);
+    float inv_global_sum = reciprocal_positive_rsqrt(global_sum);
 
     // ---------------------------------------------------
     // Step 4: Normalize & Write (Pass 3)
@@ -173,16 +159,16 @@ __global__ void softmax_kernel_fp32_opt(const float* __restrict__ input, float* 
         float4 v_out;
 
         // 展开计算，禁止 FMA
-        float e_x = expf(sub_strict(v_in.x, global_max));
+        float e_x = __expf(sub_strict(v_in.x, global_max));
         v_out.x   = mul_strict(e_x, inv_global_sum);
 
-        float e_y = expf(sub_strict(v_in.y, global_max));
+        float e_y = __expf(sub_strict(v_in.y, global_max));
         v_out.y   = mul_strict(e_y, inv_global_sum);
 
-        float e_z = expf(sub_strict(v_in.z, global_max));
+        float e_z = __expf(sub_strict(v_in.z, global_max));
         v_out.z   = mul_strict(e_z, inv_global_sum);
 
-        float e_w = expf(sub_strict(v_in.w, global_max));
+        float e_w = __expf(sub_strict(v_in.w, global_max));
         v_out.w   = mul_strict(e_w, inv_global_sum);
 
         reinterpret_cast<float4*>(row_output)[i] = v_out;
@@ -191,7 +177,7 @@ __global__ void softmax_kernel_fp32_opt(const float* __restrict__ input, float* 
     // Scalar Loop
     for (int i = vec_cols * 4 + tid; i < cols; i += blockDim.x) {
         float val = row_input[i];
-        float e = expf(sub_strict(val, global_max));
+        float e = __expf(sub_strict(val, global_max));
         row_output[i] = mul_strict(e, inv_global_sum);
     }
 }

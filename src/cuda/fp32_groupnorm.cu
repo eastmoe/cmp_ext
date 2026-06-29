@@ -1,12 +1,11 @@
 // =========================================================
-// 文件名: groupnorm_scaled_h2rcp.cu
-// 方案: 使用 h2rcp，但结合 Scaling Trick 绕过 FP16 范围限制
+// 文件名: groupnorm_rsqrt.cu
+// 方案: 使用 rsqrtf 计算正分母倒数，避免半精度 RCP 转换路径
 // =========================================================
 
 #include <cstdio>
 #include <algorithm>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h> 
 
 #define WARP_SIZE 32
 #define BLOCK_SIZE 256
@@ -19,11 +18,8 @@ __device__ __forceinline__ float warpReduceSum(float val) {
     return val;
 }
 
-// 保留原始实现
-__device__ __forceinline__ float compute_rcp_constrained(float v) {
-    __half2 v_h2 = __float2half2_rn(v);
-    __half2 rcp_h2 = h2rcp(v_h2);
-    return __low2float(rcp_h2);
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float v) {
+    return rsqrtf(__fmul_rn(v, v));
 }
 
 __global__ void __launch_bounds__(BLOCK_SIZE) GroupNormKernelFP32(
@@ -98,22 +94,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE) GroupNormKernelFP32(
     __syncthreads();
 
     // ---------------------------------------------------------
-    // 【修改点】Scaling Trick + h2rcp
+    // 【修改点】通过 rsqrtf(N * N) 得到正分母倒数，删除半精度 RCP 缩放路径
     // ---------------------------------------------------------
-    
-    // 1. 定义缩放系数 1/256 (2的幂次，无损)
-    // 100万元素缩小后约为 3906，安全处于 FP16 范围内
-    float scale_factor = 0.00390625f; 
-
-    // 2. 先缩小 N
-    float n_scaled = __fmul_rn(f_num_elements, scale_factor);
-
-    // 3. 计算 1 / (N_scaled) = 1 / (N * scale) = 1/N / scale
-    float rcp_n_scaled = compute_rcp_constrained(n_scaled);
-
-    // 4. 还原结果: (1/N_scaled) * scale = 1/N
-    float rcp_N = __fmul_rn(rcp_n_scaled, scale_factor);
-
+    float rcp_N = reciprocal_positive_rsqrt(f_num_elements);
     // ---------------------------------------------------------
 
     float mean = __fmul_rn(s_mem[0], rcp_N);

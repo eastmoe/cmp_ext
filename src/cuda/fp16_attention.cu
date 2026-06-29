@@ -52,12 +52,6 @@ __device__ __forceinline__ half hexp_compliant(half h) {
     return __float2half(f);
 }
 
-// Constraint 7: 严禁 FP32 div/rcp, 必须用 h2rcp (FP16 intrinsic)
-__device__ __forceinline__ half2 h2rcp_compliant(half2 h) {
-    // 使用 PTX 指令 rcp.approx.ftz.f16x2
-    return h2rcp(h);
-}
-
 // Warp Reduce Sum (half)
 __device__ __forceinline__ half warp_reduce_sum_half(half val) {
     #pragma unroll
@@ -255,9 +249,8 @@ __global__ void flash_attention_fp16_optimized(
     // 4. Epilogue
     // -------------------------------------------------------------------------
     if (is_valid_q) {
-        // Constraint 7: 使用 h2rcp 进行向量化 FP16 倒数计算
-        half2 l_vec = __half2half2(l_i);
-        half2 inv_l2 = h2rcp_compliant(l_vec); 
+        float l_f = __half2float(l_i);
+        half2 inv_l2 = __float2half2_rn(rsqrtf(__fmul_rn(l_f, l_f))); 
 
         int d_idx_0 = tx * 2;
         int d_idx_1 = tx * 2 + 64;

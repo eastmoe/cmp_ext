@@ -14,7 +14,7 @@
 #define ERF_A5 1.061405429f
 
 // 约束：Exp 必须在 FP32 下计算
-__device__ __forceinline__ half2 custom_exp_h2_via_fp32(half2 x) {
+__device__ __forceinline__ __half2 custom_exp_h2_via_fp32(__half2 x) {
     float2 f = __half22float2(x);
     f.x = __expf(f.x);
     f.y = __expf(f.y);
@@ -50,8 +50,11 @@ __global__ void erf_kernel_fp16(const half* input, half* output, int n) {
         half2 denom = __hfma2(H2(ERF_P), x, H2(1.0f));
 
         // 3. Reciprocal t = 1/denom
-        // 约束: 使用 h2rcp
-        half2 t = h2rcp(denom);
+        float2 denom_f = __half22float2(denom);
+        float2 t_f;
+        t_f.x = rsqrtf(__fmul_rn(denom_f.x, denom_f.x));
+        t_f.y = rsqrtf(__fmul_rn(denom_f.y, denom_f.y));
+        half2 t = __float22half2_rn(t_f);
 
         // 4. Polynomial (Horner's Method) with FMA
         // poly = ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t
@@ -103,7 +106,8 @@ __global__ void erf_kernel_fp16(const half* input, half* output, int n) {
         
         // 标量 FMA
         half denom = __hfma(H(ERF_P), x, H(1.0f));
-        half t = hrcp(denom);
+        float denom_f = __half2float(denom);
+        half t = __float2half(rsqrtf(__fmul_rn(denom_f, denom_f)));
 
         half poly = __hfma(H(ERF_A5), t, H(ERF_A4));
         poly = __hfma(poly, t, H(ERF_A3));

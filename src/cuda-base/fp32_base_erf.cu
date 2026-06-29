@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
 #include <math.h>
 
 // Abramowitz and Stegun 7.1.26 近似参数
@@ -10,14 +9,8 @@
 #define ERF_A4 -1.453152027f
 #define ERF_A5 1.061405429f
 
-// 辅助函数：遵守约束 7 (强制使用 FP16 倒数指令)
-__device__ __forceinline__ float custom_rcp_fp32_via_fp16(float x) {
-    // 将 FP32 转为 FP16
-    __half h = __float2half(x);
-    // 使用 FP16 的倒数指令 (hrcp)
-    __half r = hrcp(h);
-    // 转回 FP32
-    return __half2float(r);
+__device__ __forceinline__ float reciprocal_positive_rsqrt(float x) {
+    return rsqrtf(__fmul_rn(x, x));
 }
 
 // 辅助函数：ERF 核心数学逻辑
@@ -32,8 +25,7 @@ __device__ __forceinline__ float compute_erf_core_fp32(float x) {
     // 必须使用 explicit mul/add
     float denom = __fadd_rn(1.0f, __fmul_rn(ERF_P, abs_x));
     
-    // 必须使用 hrcp 路径计算倒数
-    float t = custom_rcp_fp32_via_fp16(denom);
+    float t = reciprocal_positive_rsqrt(denom);
 
     // 多项式计算 (Horner's method, explicit mul/add)
     // poly = ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t

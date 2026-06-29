@@ -26,17 +26,19 @@ __device__ void softmax_block_bf16(float* s_data, int len) {
     if (tid == 0) {
         float local_sum = 0.0f;
         for (int i = 0; i < len; ++i) {
-            float val = expf(s_data[i] - max_v);
+            float diff = __fsub_rn(s_data[i], max_v);
+            float val = __expf(diff);
             s_data[i] = val;
-            local_sum += val;
+            local_sum = __fadd_rn(local_sum, val);
         }
         s_sum = local_sum;
     }
     __syncthreads();
 
-    float inv_sum = 1.0f / (s_sum + 1e-6f);
+    float denom = __fadd_rn(s_sum, 1e-6f);
+    float inv_sum = rsqrtf(__fmul_rn(denom, denom));
     for (int i = tid; i < len; i += blockDim.x) {
-        s_data[i] *= inv_sum;
+        s_data[i] = __fmul_rn(s_data[i], inv_sum);
     }
 }
 
@@ -65,7 +67,8 @@ __global__ void attention_bf16_kernel(
         const __nv_bfloat16* k_ptr = k_base + i * D;
         
         for (int d = tid; d < D; d += blockDim.x) {
-            dot += __bfloat162float(q_ptr[d]) * __bfloat162float(k_ptr[d]);
+            float prod = __fmul_rn(__bfloat162float(q_ptr[d]), __bfloat162float(k_ptr[d]));
+            dot = __fadd_rn(dot, prod);
         }
         
         __shared__ float row_dot;
@@ -76,7 +79,7 @@ __global__ void attention_bf16_kernel(
         __syncthreads();
         
         if (tid == 0) {
-            s_logits[i] = row_dot * scale;
+            s_logits[i] = __fmul_rn(row_dot, scale);
         }
         __syncthreads();
     }
@@ -90,7 +93,8 @@ __global__ void attention_bf16_kernel(
     for (int d = tid; d < D; d += blockDim.x) {
         float val = 0.0f;
         for (int i = 0; i < S; ++i) {
-            val += s_logits[i] * __bfloat162float(v_base[i * D + d]);
+            float prod = __fmul_rn(s_logits[i], __bfloat162float(v_base[i * D + d]));
+            val = __fadd_rn(val, prod);
         }
         out_ptr[d] = __float2bfloat16(val);
     }
