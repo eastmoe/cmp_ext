@@ -1,3 +1,5 @@
 *.pyd
 *.log
 build/
+*.whl
+cmpext3.egg-info/
