@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cassert>
+#include <cstdint>
 #include <cuda_runtime.h>
 
 
@@ -16,13 +17,59 @@
 // 线程块大小：(BM/TM) * (BN/TN) = 16 * 16 = 256 线程
 // 这与之前的 block_size 数量不同，但这是内部实现细节，外部无需感知
 
-// 强制不使用 FMA (Fused Multiply-Add)
-__device__ __forceinline__ float mul_no_fma(float a, float b) {
-    return __fmul_rn(a, b);
+__device__ __forceinline__ uint32_t get_smem_offset_fp32(const void* ptr) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
-__device__ __forceinline__ float add_no_fma(float a, float b) {
-    return __fadd_rn(a, b);
+// Keep FP32 multiply and add as separate scalar PTX instructions.
+__device__ __forceinline__ float scalar_ptx_mul_rn_no_fma_f32(float lhs_value, float rhs_value) {
+    uint32_t a_bits = __float_as_uint(lhs_value);
+    uint32_t b_bits = __float_as_uint(rhs_value);
+    uint32_t out_bits;
+    asm volatile(
+        "{ .reg .f32 fa, fb, fo;\n\t"
+        "mov.b32 fa, %1;\n\t"
+        "mov.b32 fb, %2;\n\t"
+        "mul.rn.f32 fo, fa, fb;\n\t"
+        "mov.b32 %0, fo;\n\t"
+        "}\n\t"
+        : "=r"(out_bits)
+        : "r"(a_bits), "r"(b_bits)
+    );
+    return __uint_as_float(out_bits);
+}
+
+__device__ __forceinline__ float scalar_ptx_add_rn_no_fma_f32(float lhs_value, float rhs_value) {
+    uint32_t a_bits = __float_as_uint(lhs_value);
+    uint32_t b_bits = __float_as_uint(rhs_value);
+    uint32_t out_bits;
+    asm volatile(
+        "{ .reg .f32 fa, fb, fo;\n\t"
+        "mov.b32 fa, %1;\n\t"
+        "mov.b32 fb, %2;\n\t"
+        "add.rn.f32 fo, fa, fb;\n\t"
+        "mov.b32 %0, fo;\n\t"
+        "}\n\t"
+        : "=r"(out_bits)
+        : "r"(a_bits), "r"(b_bits)
+    );
+    return __uint_as_float(out_bits);
+}
+
+__device__ __forceinline__ float4 ptx_ld_shared_v4_f32(const float* ptr) {
+    float4 out;
+    uint32_t smem = get_smem_offset_fp32(ptr);
+    uint32_t x, y, z, w;
+    asm volatile(
+        "ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];\n\t"
+        : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+        : "r"(smem)
+    );
+    out.x = __uint_as_float(x);
+    out.y = __uint_as_float(y);
+    out.z = __uint_as_float(z);
+    out.w = __uint_as_float(w);
+    return out;
 }
 
 // ==========================================
@@ -135,18 +182,18 @@ __global__ void gemm_fp32_ga100_kernel(
             // 从 s_a 读取 8 个 float (A 的一列，对应 C 的 8 行)
             // 因为 s_a 已经转置存储，这里读取 s_a[kk][ty*8 ... ty*8+7] 是连续的！
             // 使用 float4 向量化读取
-            float4* ptr_sa = (float4*)&s_a[kk][ty * TM];
-            float4 va1 = ptr_sa[0];
-            float4 va2 = ptr_sa[1];
+            const float* ptr_sa = &s_a[kk][ty * TM];
+            float4 va1 = ptx_ld_shared_v4_f32(ptr_sa);
+            float4 va2 = ptx_ld_shared_v4_f32(ptr_sa + 4);
             
             r_a[0] = va1.x; r_a[1] = va1.y; r_a[2] = va1.z; r_a[3] = va1.w;
             r_a[4] = va2.x; r_a[5] = va2.y; r_a[6] = va2.z; r_a[7] = va2.w;
 
             // 从 s_b 读取 8 个 float (B 的一行，对应 C 的 8 列)
             // s_b[kk][tx*8 ... tx*8+7] 也是连续的
-            float4* ptr_sb = (float4*)&s_b[kk][tx * TN];
-            float4 vb1 = ptr_sb[0];
-            float4 vb2 = ptr_sb[1];
+            const float* ptr_sb = &s_b[kk][tx * TN];
+            float4 vb1 = ptx_ld_shared_v4_f32(ptr_sb);
+            float4 vb2 = ptx_ld_shared_v4_f32(ptr_sb + 4);
 
             r_b[0] = vb1.x; r_b[1] = vb1.y; r_b[2] = vb1.z; r_b[3] = vb1.w;
             r_b[4] = vb2.x; r_b[5] = vb2.y; r_b[6] = vb2.z; r_b[7] = vb2.w;
@@ -156,8 +203,8 @@ __global__ void gemm_fp32_ga100_kernel(
             for (int i = 0; i < TM; ++i) {
                 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
-                    float prod = mul_no_fma(r_a[i], r_b[j]);
-                    r_c[i][j] = add_no_fma(r_c[i][j], prod);
+                    float prod = scalar_ptx_mul_rn_no_fma_f32(r_a[i], r_b[j]);
+                    r_c[i][j] = scalar_ptx_add_rn_no_fma_f32(r_c[i][j], prod);
                 }
             }
         }
@@ -193,6 +240,15 @@ __global__ void add_bias_fp32_vec4_kernel(
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
+    if ((cols & 3) != 0) {
+        int total_elements = rows * cols;
+        for (int i = tid; i < total_elements; i += stride) {
+            int c = i % cols;
+            output[i] = scalar_ptx_add_rn_no_fma_f32(output[i], bias[c]);
+        }
+        return;
+    }
+
     int vec_cols = cols / 4;
     int vec_size = rows * vec_cols; 
 
@@ -205,24 +261,12 @@ __global__ void add_bias_fp32_vec4_kernel(
         float4 b_val = bias_vec[col_vec_idx];
         float4 o_val = out_vec[i];
         
-        o_val.x = add_no_fma(o_val.x, b_val.x);
-        o_val.y = add_no_fma(o_val.y, b_val.y);
-        o_val.z = add_no_fma(o_val.z, b_val.z);
-        o_val.w = add_no_fma(o_val.w, b_val.w);
+        o_val.x = scalar_ptx_add_rn_no_fma_f32(o_val.x, b_val.x);
+        o_val.y = scalar_ptx_add_rn_no_fma_f32(o_val.y, b_val.y);
+        o_val.z = scalar_ptx_add_rn_no_fma_f32(o_val.z, b_val.z);
+        o_val.w = scalar_ptx_add_rn_no_fma_f32(o_val.w, b_val.w);
         
         out_vec[i] = o_val;
-    }
-
-    // 处理非 4 倍数尾部
-    int tail_start = vec_cols * 4;
-    if (tail_start < cols) {
-        int total_elements = rows * cols;
-        for (int i = tid; i < total_elements; i += stride) {
-            int c = i % cols;
-            if (c >= tail_start) {
-                output[i] = add_no_fma(output[i], bias[c]);
-            }
-        }
     }
 }
 

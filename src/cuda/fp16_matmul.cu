@@ -29,6 +29,26 @@ __device__ __forceinline__ uint32_t get_smem_offset(void* ptr) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
+__device__ __forceinline__ uint32_t bits_from_half2(half2 value) {
+    __half2_raw raw = static_cast<__half2_raw>(value);
+    return static_cast<uint32_t>(raw.x) | (static_cast<uint32_t>(raw.y) << 16);
+}
+
+__device__ __forceinline__ half2 half2_from_bits(uint32_t bits) {
+    half lo = __ushort_as_half(static_cast<unsigned short>(bits & 0xffffu));
+    half hi = __ushort_as_half(static_cast<unsigned short>(bits >> 16));
+    return make_half2(lo, hi);
+}
+
+__device__ __forceinline__ half2 ptx_fma_rn_f16x2(half2 a, half2 b, half2 acc) {
+    uint32_t out;
+    asm volatile(
+        "fma.rn.f16x2 %0, %1, %2, %3;\n\t"
+        : "=&r"(out)
+        : "r"(bits_from_half2(a)), "r"(bits_from_half2(b)), "r"(bits_from_half2(acc)));
+    return half2_from_bits(out);
+}
+
 // 异步拷贝: Global -> Shared (16 bytes, ZFILL 模式)
 __device__ __forceinline__ void cp_async_pred_zfill(void* smem_ptr, const void* glob_ptr, bool src_valid) {
     uint32_t smem_int_ptr = get_smem_offset(smem_ptr);
@@ -244,8 +264,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE) gemm_fp16_ampere_optimized_v3(
                 #pragma unroll
                 for (int j = 0; j < TN / 2; j++) {
                     // C = A * B + C using FP16 HW instruction
-                    accum[i*2][j]   = __hfma2(a_top, frag_b[j], accum[i*2][j]);
-                    accum[i*2+1][j] = __hfma2(a_bot, frag_b[j], accum[i*2+1][j]);
+                    accum[i*2][j]   = ptx_fma_rn_f16x2(a_top, frag_b[j], accum[i*2][j]);
+                    accum[i*2+1][j] = ptx_fma_rn_f16x2(a_bot, frag_b[j], accum[i*2+1][j]);
                 }
             }
         }

@@ -9,7 +9,7 @@ max_workers = multiprocessing.cpu_count()
 
 setup(
     name='cmpext3',
-    version='0.0.1',                       # 版本号
+    version='0.0.2',                       # 版本号
     description='A Pytorch Extension for CMP 170HX.',  # 简短描述
     author='eastmoe',
     url='https://github.com/eastmoe/cmp_ext',

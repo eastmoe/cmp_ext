@@ -59,12 +59,87 @@ __device__ __forceinline__ __nv_bfloat162 half2_to_bf16x2(half2 value) {
     return __float22bfloat162_rn(__half22float2(value));
 }
 
-__device__ __forceinline__ float mul_no_fma(float a, float b) {
-    return __fmul_rn(a, b);
+__device__ __forceinline__ uint32_t get_smem_offset_bf16(const void* ptr) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
-__device__ __forceinline__ float add_no_fma(float a, float b) {
-    return __fadd_rn(a, b);
+__device__ __forceinline__ uint32_t ptx_ld_shared_u16_bf16(const void* ptr) {
+    uint16_t out;
+    uint32_t smem_int_ptr = get_smem_offset_bf16(ptr);
+    asm volatile("ld.shared.u16 %0, [%1];\n\t" : "=h"(out) : "r"(smem_int_ptr));
+    return static_cast<uint32_t>(out);
+}
+
+__device__ __forceinline__ int4 ptx_ld_shared_v4_b32_bf16(const void* ptr) {
+    int4 out;
+    uint32_t smem_int_ptr = get_smem_offset_bf16(ptr);
+    asm volatile(
+        "ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];\n\t"
+        : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w)
+        : "r"(smem_int_ptr)
+    );
+    return out;
+}
+
+__device__ __forceinline__ uint32_t ptx_dup_low_bf16(uint32_t value) {
+    uint32_t out;
+    asm volatile("prmt.b32 %0, %1, %1, 0x1010;\n\t" : "=r"(out) : "r"(value));
+    return out;
+}
+
+__device__ __forceinline__ uint32_t ptx_dup_high_bf16(uint32_t value) {
+    uint32_t out;
+    asm volatile("prmt.b32 %0, %1, %1, 0x3232;\n\t" : "=r"(out) : "r"(value));
+    return out;
+}
+
+__device__ __forceinline__ uint32_t ptx_fma_rn_bf16x2(uint32_t a, uint32_t b, uint32_t acc) {
+    uint32_t out;
+    asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n\t" : "=&r"(out) : "r"(a), "r"(b), "r"(acc));
+    return out;
+}
+
+__device__ __forceinline__ float scalar_ptx_mul_rn_no_fma_bf16(float lhs_value, float rhs_value) {
+    uint32_t a_bits = __float_as_uint(lhs_value);
+    uint32_t b_bits = __float_as_uint(rhs_value);
+    uint32_t out_bits;
+    asm volatile(
+        "{ .reg .f32 fa, fb, fo;\n\t"
+        "mov.b32 fa, %1;\n\t"
+        "mov.b32 fb, %2;\n\t"
+        "mul.rn.f32 fo, fa, fb;\n\t"
+        "mov.b32 %0, fo;\n\t"
+        "}\n\t"
+        : "=r"(out_bits)
+        : "r"(a_bits), "r"(b_bits)
+    );
+    return __uint_as_float(out_bits);
+}
+
+__device__ __forceinline__ float scalar_ptx_add_rn_no_fma_bf16(float lhs_value, float rhs_value) {
+    uint32_t a_bits = __float_as_uint(lhs_value);
+    uint32_t b_bits = __float_as_uint(rhs_value);
+    uint32_t out_bits;
+    asm volatile(
+        "{ .reg .f32 fa, fb, fo;\n\t"
+        "mov.b32 fa, %1;\n\t"
+        "mov.b32 fb, %2;\n\t"
+        "add.rn.f32 fo, fa, fb;\n\t"
+        "mov.b32 %0, fo;\n\t"
+        "}\n\t"
+        : "=r"(out_bits)
+        : "r"(a_bits), "r"(b_bits)
+    );
+    return __uint_as_float(out_bits);
+}
+
+__device__ __forceinline__ __nv_bfloat16 bf16_from_u16(uint32_t bits) {
+    union {
+        uint16_t u;
+        __nv_bfloat16 b;
+    } value;
+    value.u = static_cast<uint16_t>(bits);
+    return value.b;
 }
 
 // =========================================================================
@@ -85,9 +160,9 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
     __shared__ alignas(16) __nv_bfloat16 smem_b[2][BK][BN + PAD];
 
     // 寄存器分配
-    half2 c_reg[TM][TN / 2];
-    __nv_bfloat16 a_frag[TM];
-    half2 b_frag[TN / 2];
+    uint32_t c_reg[TM][TN / 2];
+    uint32_t a_frag[TM];
+    uint32_t b_frag[TN / 2];
 
     int4 ldg_a_reg[2]; 
     int4 ldg_b_reg[2];
@@ -97,7 +172,7 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
     for (int i = 0; i < TM; ++i) {
         #pragma unroll
         for (int j = 0; j < TN / 2; ++j) {
-            c_reg[i][j] = __float2half2_rn(0.0f);
+            c_reg[i][j] = 0u;
         }
     }
 
@@ -203,28 +278,22 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
         for (int k_step = 0; k_step < BK; ++k_step) {
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
-                // SMEM load: scalar is fine for A row-major
-                a_frag[i] = smem_a[compute_stage][ty * TM + i][k_step];
+                a_frag[i] = ptx_ld_shared_u16_bf16(&smem_a[compute_stage][ty * TM + i][k_step]);
             }
 
             // SMEM load B: packed int4. smem_b layout guarantees alignment
-            int4 b_vec = *reinterpret_cast<int4*>(&smem_b[compute_stage][k_step][tx * TN]);
-            __nv_bfloat16* b_ptr = reinterpret_cast<__nv_bfloat16*>(&b_vec);
-
-            #pragma unroll
-            for(int j=0; j < TN / 2; ++j) {
-                __nv_bfloat162 b_packed;
-                b_packed.x = b_ptr[j * 2];
-                b_packed.y = b_ptr[j * 2 + 1];
-                b_frag[j] = bf16x2_to_half2(b_packed);
-            }
+            int4 b_vec = ptx_ld_shared_v4_b32_bf16(&smem_b[compute_stage][k_step][tx * TN]);
+            b_frag[0] = static_cast<uint32_t>(b_vec.x);
+            b_frag[1] = static_cast<uint32_t>(b_vec.y);
+            b_frag[2] = static_cast<uint32_t>(b_vec.z);
+            b_frag[3] = static_cast<uint32_t>(b_vec.w);
 
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
-                half2 a_val = bf16_to_half2(a_frag[i]);
+                uint32_t a_val = ptx_dup_low_bf16(a_frag[i]);
                 #pragma unroll
                 for (int j = 0; j < TN / 2; ++j) {
-                    c_reg[i][j] = __hfma2(a_val, b_frag[j], c_reg[i][j]);
+                    c_reg[i][j] = ptx_fma_rn_bf16x2(a_val, b_frag[j], c_reg[i][j]);
                 }
             }
         }
@@ -246,10 +315,10 @@ __global__ void __launch_bounds__(256) gemm_bf16_kernel(
             for (int j = 0; j < TN / 2; ++j) {
                 int g_c = global_col_start + j * 2;
                 if (g_c < N) {
-                    __nv_bfloat162 out = half2_to_bf16x2(c_reg[i][j]);
-                    C[g_r * ldc + g_c] = out.x;
+                    uint32_t out = c_reg[i][j];
+                    C[g_r * ldc + g_c] = bf16_from_u16(out);
                     if (g_c + 1 < N) {
-                        C[g_r * ldc + g_c + 1] = out.y;
+                        C[g_r * ldc + g_c + 1] = bf16_from_u16(out >> 16);
                     }
                 }
             }
@@ -377,7 +446,7 @@ __global__ void __launch_bounds__(256) gemm_bf16_safe_kernel(
                 a_frag[i] = smem_a[compute_stage][ty * TM + i][k_step];
             }
 
-            int4 b_vec = *reinterpret_cast<int4*>(&smem_b[compute_stage][k_step][tx * TN]);
+            int4 b_vec = ptx_ld_shared_v4_b32_bf16(&smem_b[compute_stage][k_step][tx * TN]);
             __nv_bfloat16* b_ptr = reinterpret_cast<__nv_bfloat16*>(&b_vec);
 
             #pragma unroll
@@ -390,8 +459,8 @@ __global__ void __launch_bounds__(256) gemm_bf16_safe_kernel(
                 float a_val = __bfloat162float(a_frag[i]);
                 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
-                    float prod = mul_no_fma(a_val, __bfloat162float(b_frag[j]));
-                    c_reg[i][j] = add_no_fma(c_reg[i][j], prod);
+                    float prod = scalar_ptx_mul_rn_no_fma_bf16(a_val, __bfloat162float(b_frag[j]));
+                    c_reg[i][j] = scalar_ptx_add_rn_no_fma_bf16(c_reg[i][j], prod);
                 }
             }
         }
